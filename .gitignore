@@ -1,5 +1,7 @@
-venv/  
-.env  
-__pycache__/  
-*.pyc  
-.chainlit/ 
+tokens/
+histories/
+credentials.json
+token.json
+.env
+__pycache__/
+venv/
