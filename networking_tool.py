@@ -1,0 +1,557 @@
+"""
+networking_tool.py  — Advanced Edition
+────────────────────────────────────────────────────────────────────────────────
+Full networking intelligence for Mynd:
+
+  ✅ Contact storage with rich metadata
+  ✅ Smart follow-up scoring (how hot is this lead?)
+  ✅ Multi-platform message variants (WhatsApp / LinkedIn / Email)
+  ✅ Event-level analytics (who did I meet at X?)
+  ✅ Follow-up reminders (contacts not followed up after N days)
+  ✅ Conversation notes per contact (multiple touchpoints)
+  ✅ Regex + LLM-assisted field extraction fallback
+  ✅ Profile system (your bio auto-injected into every message)
+────────────────────────────────────────────────────────────────────────────────
+"""
+
+import os
+import json
+import datetime
+import re
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+CONTACTS_DIR = "contacts"
+PROFILES_DIR = os.path.join(CONTACTS_DIR, "profiles")
+os.makedirs(CONTACTS_DIR, exist_ok=True)
+os.makedirs(PROFILES_DIR, exist_ok=True)
+CONTACTS_FILE = os.path.join(CONTACTS_DIR, "contacts.json")
+PROFILE_FILE  = os.path.join(CONTACTS_DIR, "my_profile.json")  # Legacy global
+
+
+# ── EMPTY PROFILE TEMPLATE (Users must fill this) ─────────────────────────────
+EMPTY_PROFILE = {
+    "name":       "",
+    "email":      "",
+    "phone":      "",
+    "university": "",
+    "domains":    "",
+    "org":        "",
+    "linkedin":   "",
+    "instagram":  "",
+    "tagline":    "",
+    "setup_complete": False
+}
+
+
+# ── Profile helpers - Per-user ────────────────────────────────────────────────
+
+def get_user_profile_path(user_id: str) -> str:
+    """Get per-user profile file path"""
+    return os.path.join(PROFILES_DIR, f"profile_{user_id}.json")
+
+
+def load_user_profile(user_id: str) -> dict:
+    """Load user's personal profile. Returns empty if not set up yet."""
+    profile_path = get_user_profile_path(user_id)
+    if os.path.exists(profile_path):
+        with open(profile_path) as f:
+            return json.load(f)
+    
+    # Check legacy global profile
+    if os.path.exists(PROFILE_FILE):
+        with open(PROFILE_FILE) as f:
+            global_profile = json.load(f)
+            # Migrate to per-user
+            save_user_profile(user_id, global_profile)
+            return global_profile
+    
+    return EMPTY_PROFILE.copy()
+
+
+def save_user_profile(user_id: str, profile: dict):
+    """Save user's personal profile"""
+    profile_path = get_user_profile_path(user_id)
+    with open(profile_path, "w") as f:
+        json.dump(profile, f, indent=2)
+
+
+def is_profile_setup(user_id: str) -> bool:
+    """Check if user has completed profile setup"""
+    profile = load_user_profile(user_id)
+    # Profile is setup if name and at least one social is provided
+    return bool(profile.get("name")) and bool(
+        profile.get("linkedin") or profile.get("instagram") or profile.get("email")
+    )
+
+
+def profile_setup_status(user_id: str) -> dict:
+    """Get profile completeness status"""
+    profile = load_user_profile(user_id)
+    required_fields = ["name", "linkedin", "instagram"]
+    missing = [f for f in required_fields if not profile.get(f)]
+    return {
+        "complete": len(missing) == 0,
+        "missing": missing,
+        "profile": profile
+    }
+
+
+def load_profile() -> dict:
+    """Legacy function for backward compatibility"""
+    if os.path.exists(PROFILE_FILE):
+        with open(PROFILE_FILE) as f:
+            return json.load(f)
+    return EMPTY_PROFILE.copy()
+
+
+def save_profile(profile: dict):
+    """Legacy function - save global profile"""
+    with open(PROFILE_FILE, "w") as f:
+        json.dump(profile, f, indent=2)
+
+
+def update_profile_field(key: str, value: str, user_id: str = None) -> dict:
+    """Update a profile field. If user_id provided, updates user profile; else global"""
+    if user_id:
+        profile = load_user_profile(user_id)
+        profile[key] = value
+        save_user_profile(user_id, profile)
+    else:
+        profile = load_profile()
+        profile[key] = value
+        save_profile(profile)
+    return profile
+
+
+def format_profile_card(profile: dict) -> str:
+    p = profile
+    has_data = any([p.get('name'), p.get('email'), p.get('linkedin')])
+    
+    if not has_data:
+        return "❌ **Profile not set up yet!** Say `/profile` to add your details."
+    
+    lines = [f"👤 **{p.get('name', '—')}**"]
+    if p.get('email'):     lines.append(f"📧 {p['email']}")
+    if p.get('phone'):     lines.append(f"📱 {p['phone']}")
+    if p.get('university'): lines.append(f"🎓 {p['university']}")
+    if p.get('domains'):   lines.append(f"🔬 {p['domains']}")
+    if p.get('org'):       lines.append(f"🏢 {p['org']}")
+    if p.get('linkedin'):  lines.append(f"🔗 LinkedIn: {p['linkedin']}")
+    if p.get('instagram'): lines.append(f"📸 Instagram: {p['instagram']}")
+    if p.get('tagline'):   lines.append(f"💬 _{p['tagline']}_")
+    
+    return "\n".join(lines)
+
+
+# ── Contact storage ────────────────────────────────────────────────────────────
+
+def load_contacts() -> list:
+    if os.path.exists(CONTACTS_FILE):
+        with open(CONTACTS_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_contacts(contacts: list):
+    with open(CONTACTS_FILE, "w") as f:
+        json.dump(contacts, f, indent=2)
+
+
+def _next_id(contacts: list) -> str:
+    return f"c{len(contacts) + 1:04d}"
+
+
+def add_contact(contact_data: dict) -> dict:
+    """
+    Save a new contact or update existing (matched by name + event).
+    Auto-computes follow-up score on save.
+    """
+    contacts = load_contacts()
+    name  = contact_data.get("name", "").strip().lower()
+    event = contact_data.get("event", "").strip().lower()
+
+    for i, c in enumerate(contacts):
+        if (c.get("name", "").lower() == name
+                and c.get("event", "").lower() == event):
+            contacts[i].update(contact_data)
+            contacts[i]["updated_at"] = datetime.datetime.now().isoformat()
+            contacts[i]["score"] = _compute_score(contacts[i])
+            save_contacts(contacts)
+            return contacts[i]
+
+    contact_data["id"]            = _next_id(contacts)
+    contact_data["saved_at"]      = datetime.datetime.now().isoformat()
+    contact_data["message_sent"]  = False
+    contact_data["touchpoints"]   = []          # list of follow-up notes
+    contact_data["score"]         = _compute_score(contact_data)
+    contacts.append(contact_data)
+    save_contacts(contacts)
+    return contact_data
+
+
+def add_touchpoint(contact_id: str, note: str):
+    """Log a new interaction with a contact (call, reply, meeting etc.)"""
+    contacts = load_contacts()
+    for c in contacts:
+        if c.get("id") == contact_id:
+            if "touchpoints" not in c:
+                c["touchpoints"] = []
+            c["touchpoints"].append({
+                "note": note,
+                "at": datetime.datetime.now().isoformat()
+            })
+            c["score"] = _compute_score(c)
+            save_contacts(contacts)
+            return c
+    return None
+
+
+def search_contacts(keyword: str) -> list:
+    """Full-text search across all contact fields."""
+    contacts = load_contacts()
+    kw = keyword.lower()
+    return [
+        c for c in contacts
+        if kw in " ".join([
+            str(c.get(f, ""))
+            for f in ["name", "company", "event", "role", "notes", "email", "phone"]
+        ]).lower()
+    ]
+
+
+def get_all_contacts() -> list:
+    return load_contacts()
+
+
+def get_contacts_by_event(event_name: str) -> list:
+    contacts = load_contacts()
+    ev = event_name.lower()
+    return [c for c in contacts if ev in c.get("event", "").lower()]
+
+
+def get_unsent_contacts(days_threshold: int = 3) -> list:
+    """
+    Return contacts where message_sent is False AND
+    they were saved more than `days_threshold` days ago.
+    These are the 'forgotten' leads.
+    """
+    contacts = load_contacts()
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days_threshold)
+    results = []
+    for c in contacts:
+        if not c.get("message_sent"):
+            saved = c.get("saved_at", "")
+            try:
+                saved_dt = datetime.datetime.fromisoformat(saved)
+                if saved_dt < cutoff:
+                    results.append(c)
+            except Exception:
+                results.append(c)
+    return results
+
+
+def mark_message_sent(contact_id: str, platform: str = "whatsapp"):
+    contacts = load_contacts()
+    for c in contacts:
+        if c.get("id") == contact_id:
+            c["message_sent"]    = True
+            c["message_sent_at"] = datetime.datetime.now().isoformat()
+            c["message_platform"] = platform
+            c["score"]           = _compute_score(c)
+    save_contacts(contacts)
+
+
+# ── Follow-up scoring ──────────────────────────────────────────────────────────
+
+def _compute_score(contact: dict) -> int:
+    """
+    Score a contact 0–100 on 'follow-up priority'.
+
+    Points given for:
+      +30  has phone number
+      +20  has email
+      +15  has LinkedIn
+      +10  has notes / conversation context
+      +10  has company name
+      +15  message NOT yet sent (pending follow-up)
+      -20  message already sent (deprioritise)
+      +10  multiple touchpoints (active relationship)
+      -15  saved > 7 days ago and still unsent (stale)
+    """
+    score = 0
+    if contact.get("phone"):    score += 30
+    if contact.get("email"):    score += 20
+    if contact.get("linkedin"): score += 15
+    if contact.get("notes"):    score += 10
+    if contact.get("company"):  score += 10
+
+    if not contact.get("message_sent"):
+        score += 15
+    else:
+        score -= 20
+
+    if len(contact.get("touchpoints", [])) > 0:
+        score += 10
+
+    # Stale penalty
+    saved = contact.get("saved_at", "")
+    try:
+        saved_dt = datetime.datetime.fromisoformat(saved)
+        days_old = (datetime.datetime.now() - saved_dt).days
+        if days_old > 7 and not contact.get("message_sent"):
+            score -= 15
+    except Exception:
+        pass
+
+    return max(0, min(100, score))
+
+
+def get_priority_contacts(top_n: int = 5) -> list:
+    """Return top N contacts sorted by follow-up score descending."""
+    contacts = load_contacts()
+    # Recompute scores fresh
+    for c in contacts:
+        c["score"] = _compute_score(c)
+    return sorted(contacts, key=lambda x: x.get("score", 0), reverse=True)[:top_n]
+
+
+# ── Message generation ─────────────────────────────────────────────────────────
+
+def generate_followup_message(
+    contact: dict,
+    event_name: str = "",
+    custom_note: str = "",
+    platform: str = "whatsapp",
+    user_id: str = None
+) -> tuple:
+    """
+    Generate a personalised follow-up message.
+    
+    Returns: (message, profile_complete, missing_fields)
+    
+    platform: "whatsapp" | "linkedin" | "email"
+    WhatsApp  → casual, short, warm
+    LinkedIn  → professional, mention collaboration
+    Email     → formal subject + body
+    """
+    
+    # Load USER'S actual profile (not hardcoded!)
+    profile = load_user_profile(user_id) if user_id else load_profile()
+    
+    # Check if profile is complete
+    profile_complete = bool(profile.get("name")) and bool(
+        profile.get("linkedin") or profile.get("instagram")
+    )
+    
+    missing_fields = []
+    if not profile.get("name"):
+        missing_fields.append("name")
+    if not profile.get("linkedin"):
+        missing_fields.append("LinkedIn profile")
+    if not profile.get("instagram"):
+        missing_fields.append("Instagram profile")
+    
+    # If profile incomplete, return error message
+    if not profile_complete:
+        error_msg = (
+            f"⚠️ **Can't generate follow-up message yet**\n\n"
+            f"I need your info first to personalize messages. Missing:\n"
+            + "\n".join([f"  • {f}" for f in missing_fields]) +
+            f"\n\nSay `/profile` to set up your details."
+        )
+        return (error_msg, False, missing_fields)
+    
+    # Extract contact info
+    name      = contact.get("name", "there")
+    first     = name.split()[0] if name else "there"
+    event     = event_name or contact.get("event", "the event")
+    role      = contact.get("role", "")
+    company   = contact.get("company", "")
+    notes     = custom_note or contact.get("notes", "")
+
+    # Build opening line
+    if notes:
+        opening = f"Great meeting you at {event} today — {notes}."
+    elif role and company:
+        opening = (
+            f"Great meeting you at {event} today — "
+            f"really enjoyed hearing about your work as {role} at {company}."
+        )
+    elif company:
+        opening = f"Great meeting you at {event} today — loved connecting with the {company} team."
+    else:
+        opening = f"Great meeting you at {event} today — really enjoyed our conversation."
+
+    # Build user intro from their actual data
+    profile_intro_parts = []
+    if profile.get("name"):
+        profile_intro_parts.append(f"I'm {profile['name']}")
+    if profile.get("university"):
+        profile_intro_parts.append(f"from {profile['university']}")
+    if profile.get("domains"):
+        profile_intro_parts.append(f"I work with startups in {profile['domains']}")
+    if profile.get("org"):
+        profile_intro_parts.append(f"and have exposure to {profile['org']}")
+    
+    my_intro = " ".join(profile_intro_parts) if profile_intro_parts else "I'd love to connect and explore opportunities."
+    my_value = profile.get("tagline", "I'm always keen to collaborate with ambitious founders!")
+
+    # ── WhatsApp style ─────────────────────────────────────────────────────────
+    if platform == "whatsapp":
+        message = f"Hey {first},\n\n{opening}\n\n{my_intro}.\n\n{my_value}\n\n"
+        
+        if profile.get("linkedin") or profile.get("instagram"):
+            message += "Let's stay connected:\n"
+            if profile.get("linkedin"):
+                message += f"🔗 LinkedIn: {profile['linkedin']}\n"
+            if profile.get("instagram"):
+                message += f"📸 Instagram: {profile['instagram']}"
+        
+        return (message, True, [])
+
+    # ── LinkedIn style ─────────────────────────────────────────────────────────
+    elif platform == "linkedin":
+        message = (
+            f"Hi {first},\n\n"
+            f"It was great connecting with you at {event}. "
+            f"{opening.replace('Great meeting you at ' + event + ' today — ', '')}\n\n"
+            f"{my_intro}.\n\n"
+            f"{my_value}\n\n"
+            f"Would love to stay in touch and explore collaboration opportunities. "
+            f"Feel free to message me anytime.\n\n"
+            f"Best,\n{profile.get('name', 'Mynd')}"
+        )
+        return (message, True, [])
+
+    # ── Email style ────────────────────────────────────────────────────────────
+    elif platform == "email":
+        subject = f"Great meeting you at {event} — {profile.get('name', 'Mynd')}"
+        body = (
+            f"Hi {first},\n\n"
+            f"{opening}\n\n"
+            f"{my_intro}.\n\n"
+            f"{my_value}\n\n"
+            f"I'd love to schedule a quick call to explore collaboration. "
+            f"Let me know what works for you.\n\n"
+            f"Best regards,\n"
+            f"{profile.get('name', 'Mynd')}\n"
+        )
+        if profile.get("email"):
+            body += f"Email: {profile['email']}\n"
+        if profile.get("linkedin"):
+            body += f"LinkedIn: {profile['linkedin']}\n"
+        
+        return (f"SUBJECT: {subject}\n\n{body}", True, [])
+
+    # Fallback
+    return (generate_followup_message(contact, event_name, custom_note, "whatsapp", user_id), True, [])
+            f"Instagram: {profile['instagram']}"
+        )
+        return f"SUBJECT: {subject}\n\n{body}"
+
+    # Fallback
+    return generate_followup_message(contact, event_name, custom_note, "whatsapp")
+
+
+# ── Analytics ──────────────────────────────────────────────────────────────────
+
+def get_networking_stats() -> dict:
+    contacts = load_contacts()
+    total    = len(contacts)
+    sent     = sum(1 for c in contacts if c.get("message_sent"))
+    unsent   = total - sent
+    events   = {}
+    for c in contacts:
+        e = c.get("event", "Unknown")
+        events[e] = events.get(e, 0) + 1
+    top_event = max(events, key=events.get) if events else "—"
+
+    return {
+        "total":     total,
+        "sent":      sent,
+        "unsent":    unsent,
+        "events":    events,
+        "top_event": top_event,
+    }
+
+
+def format_networking_stats() -> str:
+    s = get_networking_stats()
+    if s["total"] == 0:
+        return "📭 No contacts saved yet. Start by telling me who you met!"
+
+    event_lines = "\n".join(
+        f"  • {e}: {n} contact(s)" for e, n in s["events"].items()
+    )
+    rate = int((s["sent"] / s["total"]) * 100) if s["total"] else 0
+    bar_filled = int(rate / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+    return (
+        f"📊 **Networking Stats**\n\n"
+        f"👥 Total contacts: **{s['total']}**\n"
+        f"✅ Follow-ups sent: **{s['sent']}**\n"
+        f"⏳ Pending follow-ups: **{s['unsent']}**\n"
+        f"📈 Follow-up rate: `{bar}` {rate}%\n\n"
+        f"📍 **By event:**\n{event_lines}\n\n"
+        f"🏆 Most active event: **{s['top_event']}**"
+    )
+
+
+def format_contact_card(contact: dict, show_score: bool = True) -> str:
+    lines = [f"👤 **{contact.get('name', 'Unknown')}**"]
+
+    if contact.get("role"):    lines.append(f"💼 {contact['role']}")
+    if contact.get("company"): lines.append(f"🏢 {contact['company']}")
+    if contact.get("event"):   lines.append(f"📍 Met at: {contact['event']}")
+    if contact.get("phone"):   lines.append(f"📱 {contact['phone']}")
+    if contact.get("email"):   lines.append(f"📧 {contact['email']}")
+    if contact.get("linkedin"):lines.append(f"🔗 {contact['linkedin']}")
+    if contact.get("notes"):   lines.append(f"📝 {contact['notes']}")
+
+    touchpoints = contact.get("touchpoints", [])
+    if touchpoints:
+        lines.append(f"🤝 {len(touchpoints)} follow-up(s) logged")
+
+    if contact.get("message_sent"):
+        sent_at  = contact.get("message_sent_at", "")[:10]
+        platform = contact.get("message_platform", "")
+        lines.append(f"✅ Sent via {platform}" + (f" on {sent_at}" if sent_at else ""))
+    else:
+        lines.append("⏳ Follow-up pending")
+
+    if show_score:
+        score = contact.get("score", _compute_score(contact))
+        bar   = "🟢" if score >= 70 else "🟡" if score >= 40 else "🔴"
+        lines.append(f"{bar} Priority score: {score}/100")
+
+    lines.append(f"🆔 `{contact.get('id', '')}`")
+    return "\n".join(lines)
+
+
+def format_contacts_list(contacts: list, show_score: bool = True) -> str:
+    if not contacts:
+        return "📭 No contacts found."
+    out = f"📋 **{len(contacts)} contact(s):**\n\n"
+    for c in sorted(contacts, key=lambda x: x.get("score", 0), reverse=True):
+        out += format_contact_card(c, show_score=show_score) + "\n\n---\n\n"
+    return out.strip()
+
+
+# ── Text extraction helpers ────────────────────────────────────────────────────
+
+def extract_contact_from_text(raw: str) -> dict:
+    contact = {}
+    email = re.search(r'[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}', raw)
+    if email: contact["email"] = email.group()
+
+    phone = re.search(r'(?:\+91[\s-]?)?[6-9]\d{9}|0\d{10}', raw)
+    if phone: contact["phone"] = phone.group()
+
+    linkedin = re.search(r'linkedin\.com/in/[\w\-]+', raw, re.I)
+    if linkedin: contact["linkedin"] = "https://" + linkedin.group()
+
+    insta = re.search(r'(?:instagram\.com/|@)([\w.]+)', raw, re.I)
+    if insta: contact["instagram"] = "@" + insta.group(1)
+
+    return contact

@@ -3,6 +3,8 @@ from groq import Groq  # library to talk to Groq API and Llama model
 import os              # operating system — reads .env variables
 import datetime
 import json
+import base64
+import re
 from dotenv import load_dotenv
 from calendar_tool import (
     create_calendar_event,
@@ -11,6 +13,16 @@ from calendar_tool import (
     get_events,
     clear_user_token,
     resolve_duration
+)
+from networking_tool import (
+    add_contact,
+    search_contacts,
+    get_all_contacts,
+    generate_followup_message,
+    format_contact_card,
+    format_contacts_list,
+    mark_message_sent,
+    extract_contact_from_text,
 )
 
 load_dotenv()
@@ -26,9 +38,13 @@ os.makedirs(HISTORY_DIR, exist_ok=True)
 today = datetime.date.today()
 
 SYSTEM_PROMPT = f"""You are Mynd, an AI agent for entrepreneurs.
-You help with calendar management, networking, and daily tasks.
+You help with calendar management, networking follow-ups, and daily tasks.
 You remember everything told to you in this conversation.
 Today's date is {today.strftime("%A, %d %B %Y")}.
+
+════════════════════════════════════════════
+CALENDAR ACTIONS
+════════════════════════════════════════════
 
 When a user wants to CREATE, SCHEDULE, BLOCK, SET, or ADD a calendar
 event, meeting, reminder, or call — reply ONLY with this exact JSON:
@@ -41,49 +57,56 @@ For RECURRING events like "every monday", "every week", "daily standup",
 {{"action": "create_event", "title": "event name", "date": "as user said", "time": "as user said", "duration": "1 hour", "reminder": 30, "recurrence": {{"frequency": "weekly", "count": 10}}}}
 
 recurrence frequency must be: "daily", "weekly", or "monthly"
-recurrence count = number of times to repeat, default 10 if not specified
-recurrence until = end date as YYYY-MM-DD if user specifies an end date
 
-When a user wants to DELETE, REMOVE, CANCEL, CLEAR, DROP,
-CALL OFF, or says a meeting IS CANCELLED, WON'T HAPPEN,
-IS CALLED OFF, NOT HAPPENING — reply ONLY with this JSON:
-
+When a user wants to DELETE, REMOVE, or CANCEL an event:
 {{"action": "delete_event", "title": "event keyword", "date": "as user said"}}
 
-When a user wants to VIEW, SEE, CHECK, SHOW, LIST, or asks
-WHAT DO I HAVE or WHAT IS ON MY CALENDAR for a specific day
-— reply ONLY with this JSON:
-
+When a user wants to VIEW their calendar for a day:
 {{"action": "view_events", "date": "as user said"}}
 
-Rules that always apply:
-- date: copy exactly what user said e.g. "tomorrow", "friday", "25 april"
-- time: copy exactly what user said — use empty string if not mentioned
-- duration: copy what user said e.g. "quick call", "30 min", "2 hours"
-- reminder: minutes as integer, default 30 if not mentioned
-- Output ONLY the JSON for calendar actions. No explanation. Nothing else.
+════════════════════════════════════════════
+NETWORKING ACTIONS
+════════════════════════════════════════════
 
-If the user is just chatting and NOT asking for a calendar action,
-reply normally as a helpful friendly assistant.
-Do NOT output JSON for normal conversation.
+When a user mentions meeting someone, shares a business card, gives
+contact details, or says they met someone at an event — extract the
+contact and reply ONLY with this JSON:
+
+{{"action": "save_contact", "name": "full name", "role": "job title or role", "company": "company name", "event": "event name where they met", "phone": "phone number or empty", "email": "email or empty", "linkedin": "linkedin url or empty", "notes": "anything interesting they said or discussed"}}
+
+When a user wants to SEND, WRITE, DRAFT, or GENERATE a follow-up
+message for a contact — reply ONLY with this JSON:
+
+{{"action": "send_followup", "name": "contact name or keyword", "event": "event name", "custom_note": "any personal detail from conversation to include"}}
+
+When a user wants to SEE, SHOW, LIST, FIND, or VIEW their contacts
+or networking list — reply ONLY with this JSON:
+
+{{"action": "view_contacts", "keyword": "search term or empty string for all"}}
+
+When a user confirms they SENT a message (says "sent it", "done", "sent",
+"I sent it") and there is a pending contact — reply ONLY with this JSON:
+
+{{"action": "mark_sent", "contact_id": "the id from pending contact"}}
+
+════════════════════════════════════════════
+RULES
+════════════════════════════════════════════
+
+- Output ONLY the JSON for any of the above actions. No explanation.
+- If user is just chatting, reply normally as a helpful friendly assistant.
+- Do NOT output JSON for normal conversation.
+- For contacts: extract as much as possible, leave fields empty if unknown.
+- notes: capture interesting things — their startup idea, problem they mentioned,
+  mutual interest — this makes the follow-up message feel personal.
 """
 
 
 def get_history_path(user_id):
-    """
-    Returns the file path for storing this user's conversation history.
-    History is saved to disk so it persists across app restarts.
-    Each user gets their own file: histories/history_abc123.json
-    """
     return f"{HISTORY_DIR}/history_{user_id}.json"
 
 
 def load_history(user_id):
-    """
-    Loads conversation history from disk for this user.
-    Returns empty list if no history file exists yet.
-    This means memory survives app restarts.
-    """
     path = get_history_path(user_id)
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -92,66 +115,132 @@ def load_history(user_id):
 
 
 def save_history(user_id, history):
-    """
-    Saves conversation history to disk for this user.
-    Called after every message so nothing is lost on restart.
-    """
     path = get_history_path(user_id)
     with open(path, "w") as f:
         json.dump(history, f)
 
 
+# ── IMAGE → TEXT via Groq vision ─────────────────────────────────────────────
+
+async def extract_contact_from_image(image_bytes: bytes, mime_type: str) -> dict:
+    """
+    Send a business card image to Groq vision model.
+    Returns extracted contact fields as a dict.
+    Uses llama-4-scout which supports vision (free on Groq).
+    """
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        max_tokens=500,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{b64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a business card. Extract ALL information from it. "
+                            "Reply ONLY with a JSON object with these keys: "
+                            "name, role, company, phone, email, linkedin, website, address. "
+                            "Use empty string for any field not found. "
+                            "No explanation, no markdown, just the JSON."
+                        )
+                    }
+                ]
+            }
+        ]
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    # Parse JSON from response
+    try:
+        json_start = raw.find("{")
+        json_end = raw.rfind("}") + 1
+        if json_start != -1 and json_end > json_start:
+            return json.loads(raw[json_start:json_end])
+    except Exception:
+        pass
+
+    # Fallback to regex extraction if JSON parse fails
+    return extract_contact_from_text(raw)
+
+
+# ── Chat start ────────────────────────────────────────────────────────────────
+
 @cl.on_chat_start
 async def start():
-    # Each Chainlit session has a unique ID — use as user identifier
-    # This ensures each person's token and history are stored separately
+    from networking_tool import is_profile_setup, load_user_profile
+    
     session_id = cl.user_session.get("id")
     user_id = str(session_id)
     cl.user_session.set("user_id", user_id)
 
-    # Load this user's history from disk — survives restarts
     history = load_history(user_id)
     cl.user_session.set("history", history)
 
-    # Greet returning users differently from new users
+    # Check if user profile is set up
+    profile_setup = is_profile_setup(user_id)
+    
     if history:
-        greeting = (
-            "Welcome back! I'm **Mynd** 🚀\n\n"
-            "I remember our previous conversations. "
-            "How can I help you today?"
-        )
+        greeting = "Welcome back! I'm **Mynd** 🚀\n\n"
+        
+        # If profile not set up, remind them
+        if not profile_setup:
+            greeting += (
+                "**⚠️ One quick thing:** I need your details to personalize follow-up messages.\n"
+                "Say `/profile` to set up your name, LinkedIn, and Instagram.\n\n"
+            )
+        
+        greeting += "How can I help you today?"
     else:
         greeting = (
             "Hi! I'm **Mynd**, your entrepreneur assistant 🚀\n\n"
-            "I manage your Google Calendar — create, view, and delete "
-            "events using natural language.\n\n"
-            "Try saying:\n"
+            "**First things first:** I need YOUR information to personalize networking messages.\n"
+            "Say `/profile` to set up your name, LinkedIn, Instagram, and other details.\n\n"
+            "Then I'll help you with:\n"
+            "📅 **Calendar** — create, view, and delete events\n"
+            "🤝 **Networking** — save contacts and send personalized follow-up messages\n\n"
+            "**Calendar examples:**\n"
             "- *Block thursday 7pm for Nasscom meetup*\n"
             "- *Every monday 9am team standup*\n"
-            "- *What do I have on friday?*\n"
-            "- *Cancel my meeting tomorrow with Sowmya*\n\n"
-            "Type `/switchaccount` to connect a different Google account.\n"
-            "Type `/clearhistory` to reset our conversation memory."
+            "- *What do I have on friday?*\n\n"
+            "**Networking examples:**\n"
+            "- *I met Rahul Sharma at Voko Run, he's a fintech founder at PayNow*\n"
+            "- *Send Rahul a follow-up message*\n"
+            "- *Show all my contacts*\n"
+            "- *Upload a business card photo and I'll save it automatically*\n\n"
+            "**Commands:**\n"
+            "`/profile` — set up your personal details\n"
+            "`/switchaccount` — connect a different Google account\n"
+            "`/clearhistory` — reset conversation memory\n"
+            "`/contacts` — show all saved contacts\n"
         )
 
     await cl.Message(content=greeting).send()
 
 
+# ── Main message handler ──────────────────────────────────────────────────────
+
 @cl.on_message
 async def main(message: cl.Message):
 
-    # Get this user's conversation history and unique ID
     history = cl.user_session.get("history")
     user_id = cl.user_session.get("user_id")
 
-    # Safety checks — reset if something went wrong
     if history is None:
         history = []
     if user_id is None:
         user_id = "default"
 
     # ── COMMAND: /switchaccount ───────────────────────────────────
-    # Deletes login token only — calendar events are completely safe
     if message.content.strip().lower() == "/switchaccount":
         was_connected = clear_user_token(user_id)
         if was_connected:
@@ -170,7 +259,6 @@ async def main(message: cl.Message):
         return
 
     # ── COMMAND: /clearhistory ────────────────────────────────────
-    # Wipes conversation memory for this user — fresh start
     if message.content.strip().lower() == "/clearhistory":
         history = []
         cl.user_session.set("history", [])
@@ -178,18 +266,22 @@ async def main(message: cl.Message):
         await cl.Message(
             content="🧹 Conversation history cleared.\n\n"
                     "I've forgotten our previous chats. "
-                    "Your calendar events are untouched."
+                    "Your calendar events and contacts are untouched."
         ).send()
         return
 
+    # ── COMMAND: /contacts ────────────────────────────────────────
+    if message.content.strip().lower() == "/contacts":
+        contacts = get_all_contacts()
+        await cl.Message(content=format_contacts_list(contacts)).send()
+        return
+
     # ── HANDLE DELETION CONFIRMATION ─────────────────────────────
-    # User previously asked to delete — waiting for YES or NO
     if cl.user_session.get("awaiting_delete_confirm"):
         if message.content.strip().upper() == "YES":
             cl.user_session.set("awaiting_delete_confirm", False)
             pending = cl.user_session.get("pending_delete")
             try:
-                # Execute the deletion that was pending confirmation
                 result = delete_calendar_event(
                     user_id=user_id,
                     title_keyword=pending["title"],
@@ -201,7 +293,6 @@ async def main(message: cl.Message):
                     content=f"Error deleting event: {str(e)}"
                 ).send()
         else:
-            # User said NO or anything other than YES — cancel deletion
             cl.user_session.set("awaiting_delete_confirm", False)
             await cl.Message(
                 content="Deletion cancelled. Your event is safe. ✅"
@@ -209,13 +300,11 @@ async def main(message: cl.Message):
         return
 
     # ── HANDLE CONFLICT CONFIRMATION ─────────────────────────────
-    # User has a conflict — waiting for YES to force create or NO to cancel
     if cl.user_session.get("awaiting_conflict_confirm"):
         if message.content.strip().upper() == "YES":
             cl.user_session.set("awaiting_conflict_confirm", False)
             pending = cl.user_session.get("pending_event")
             try:
-                # Force create even though there is a conflict
                 duration_minutes = resolve_duration(
                     str(pending.get("duration", "1 hour"))
                 )
@@ -234,7 +323,6 @@ async def main(message: cl.Message):
                     content=f"Error creating event: {str(e)}"
                 ).send()
         else:
-            # User said NO — cancel creation
             cl.user_session.set("awaiting_conflict_confirm", False)
             await cl.Message(
                 content="Got it — event not created. "
@@ -242,33 +330,110 @@ async def main(message: cl.Message):
             ).send()
         return
 
+    # ── HANDLE BUSINESS CARD IMAGE UPLOAD ────────────────────────
+    # Check if user uploaded an image file (business card)
+    if message.elements:
+        for element in message.elements:
+            # Check if it's an image
+            if hasattr(element, "mime") and element.mime and element.mime.startswith("image/"):
+                await cl.Message(
+                    content="📸 Got your business card! Scanning it now..."
+                ).send()
+
+                try:
+                    # Read the image bytes
+                    with open(element.path, "rb") as f:
+                        image_bytes = f.read()
+
+                    # Extract contact info using Groq vision
+                    extracted = await extract_contact_from_image(
+                        image_bytes, element.mime
+                    )
+
+                    # Ask user for event context if not in message
+                    event_context = message.content.strip() if message.content.strip() else ""
+
+                    # Merge any event info the user typed with extracted data
+                    if event_context:
+                        extracted["notes"] = event_context
+
+                    # Show what was extracted and ask for confirmation
+                    cl.user_session.set("pending_contact", extracted)
+                    cl.user_session.set("awaiting_contact_confirm", True)
+
+                    preview = "\n".join([
+                        f"**{k.title()}:** {v}"
+                        for k, v in extracted.items()
+                        if v and k not in ["notes"]
+                    ])
+
+                    await cl.Message(
+                        content=f"✅ Here's what I extracted from the card:\n\n"
+                                f"{preview}\n\n"
+                                f"Which event did you meet them at? "
+                                f"(e.g. *Voko Run*, *Nasscom*, *TiE Chennai*)\n\n"
+                                f"Or type **SAVE** to save as-is."
+                    ).send()
+                    return
+
+                except Exception as e:
+                    await cl.Message(
+                        content=f"Couldn't read the card: {str(e)}\n\n"
+                                f"Try typing the contact details instead — "
+                                f"name, company, role, phone etc."
+                    ).send()
+                    return
+
+    # ── HANDLE CONTACT IMAGE CONFIRMATION ────────────────────────
+    if cl.user_session.get("awaiting_contact_confirm"):
+        pending = cl.user_session.get("pending_contact")
+        user_input = message.content.strip()
+
+        if user_input.upper() == "SAVE":
+            # Save without adding event name
+            saved = add_contact(pending)
+            cl.user_session.set("awaiting_contact_confirm", False)
+            cl.user_session.set("last_saved_contact", saved)
+            await cl.Message(
+                content=f"✅ Contact saved!\n\n"
+                        f"{format_contact_card(saved)}\n\n"
+                        f"Say **send followup to {saved.get('name', 'them')}** "
+                        f"when you want to generate a message."
+            ).send()
+        else:
+            # User typed event name
+            pending["event"] = user_input
+            saved = add_contact(pending)
+            cl.user_session.set("awaiting_contact_confirm", False)
+            cl.user_session.set("last_saved_contact", saved)
+            await cl.Message(
+                content=f"✅ Contact saved from **{user_input}**!\n\n"
+                        f"{format_contact_card(saved)}\n\n"
+                        f"Say **send followup to {saved.get('name', 'them')}** "
+                        f"when you're ready."
+            ).send()
+        return
+
     # ── NORMAL MESSAGE FLOW ───────────────────────────────────────
 
-    # Add the new user message to conversation history
     history.append({
         "role": "user",
         "content": message.content
     })
 
-    # Build full message list — system prompt first then entire history
-    # Groq needs the full history every time — it has no memory of its own
     full_messages = [
         {"role": "system", "content": SYSTEM_PROMPT}
     ] + history
 
-    # Send to Groq — Llama 3.3 70B does the understanding
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        max_tokens=500,
+        max_tokens=700,
         messages=full_messages
     )
 
-    # Get the reply text from Groq
     reply = response.choices[0].message.content.strip()
 
-    # Try to find and parse JSON in the reply
-    # We search for { and } rather than checking specific strings
-    # This handles any spacing or formatting Groq uses
+    # Try to parse JSON action from Groq reply
     event_data = None
     try:
         json_start = reply.find("{")
@@ -276,25 +441,21 @@ async def main(message: cl.Message):
         if json_start != -1 and json_end > json_start:
             json_str = reply[json_start:json_end]
             parsed = json.loads(json_str)
-            # Only treat as calendar action if action field is present
             if parsed.get("action") in [
-                "create_event", "delete_event", "view_events"
+                "create_event", "delete_event", "view_events",
+                "save_contact", "send_followup", "view_contacts", "mark_sent"
             ]:
                 event_data = parsed
     except json.JSONDecodeError:
-        # Not JSON — treat as normal conversation reply
         pass
 
     if event_data:
-
         action = event_data.get("action")
 
-        # ── CREATE EVENT ──────────────────────────────────────────
+        # ── CALENDAR: CREATE EVENT ────────────────────────────────
         if action == "create_event":
 
-            # If user didn't mention a time, ask before creating
             if not event_data.get("time") or event_data.get("time").strip() == "":
-                # Save partial event so we can complete it after user replies
                 cl.user_session.set("pending_event", event_data)
                 reply = (
                     f"Got it! I have your event **{event_data['title']}** "
@@ -307,13 +468,10 @@ async def main(message: cl.Message):
                 await cl.Message(content=reply).send()
                 return
 
-            # Resolve duration from natural language to minutes
-            # e.g. "quick call" = 30 min, "2 hours" = 120 min
             duration_minutes = resolve_duration(
                 str(event_data.get("duration", "1 hour"))
             )
 
-            # Check for conflicts before creating the event
             conflicts = check_conflicts(
                 user_id=user_id,
                 date_input=event_data["date"],
@@ -322,11 +480,9 @@ async def main(message: cl.Message):
             )
 
             if conflicts:
-                # Warn user about existing events in this slot
                 conflict_list = "\n".join(
                     [f"- {e.get('summary', 'Untitled')}" for e in conflicts]
                 )
-                # Save pending event in case user confirms
                 cl.user_session.set("pending_event", event_data)
                 cl.user_session.set("awaiting_conflict_confirm", True)
                 reply = (
@@ -342,7 +498,6 @@ async def main(message: cl.Message):
                 await cl.Message(content=reply).send()
                 return
 
-            # Show the user what we understood before creating
             recurrence_info = ""
             if event_data.get("recurrence"):
                 freq = event_data["recurrence"].get("frequency", "weekly")
@@ -366,7 +521,6 @@ async def main(message: cl.Message):
             ).send()
 
             try:
-                # Create the event in this user's Google Calendar
                 result = create_calendar_event(
                     user_id=user_id,
                     title=event_data["title"],
@@ -376,21 +530,15 @@ async def main(message: cl.Message):
                     reminder_minutes=int(event_data.get("reminder", 30)),
                     recurrence=event_data.get("recurrence")
                 )
-                # result is the success message from calendar_tool.py
                 reply = result
-
             except Exception as e:
-                # Tell user exactly what went wrong
                 reply = (
                     f"I understood the event but ran into an issue: {str(e)}\n\n"
-                    f"Make sure credentials.json is in your project folder "
-                    f"and Google Calendar setup is complete."
+                    f"Make sure credentials.json is in your project folder."
                 )
 
-        # ── DELETE EVENT ──────────────────────────────────────────
+        # ── CALENDAR: DELETE EVENT ────────────────────────────────
         elif action == "delete_event":
-
-            # Ask for confirmation before deleting — prevents accidents
             cl.user_session.set("pending_delete", event_data)
             cl.user_session.set("awaiting_delete_confirm", True)
             reply = (
@@ -400,10 +548,9 @@ async def main(message: cl.Message):
                 f"Type **YES** to confirm or **NO** to cancel."
             )
 
-        # ── VIEW EVENTS ───────────────────────────────────────────
+        # ── CALENDAR: VIEW EVENTS ─────────────────────────────────
         elif action == "view_events":
             try:
-                # Fetch and display all events for that day
                 result = get_events(
                     user_id=user_id,
                     date_input=event_data["date"]
@@ -412,16 +559,93 @@ async def main(message: cl.Message):
             except Exception as e:
                 reply = f"Couldn't fetch your calendar: {str(e)}"
 
-    # Add the final reply to conversation history
+        # ── NETWORKING: SAVE CONTACT ──────────────────────────────
+        elif action == "save_contact":
+            try:
+                saved = add_contact(event_data)
+                cl.user_session.set("last_saved_contact", saved)
+                reply = (
+                    f"✅ Contact saved!\n\n"
+                    f"{format_contact_card(saved)}\n\n"
+                    f"Say **send followup to {saved.get('name', 'them')}** "
+                    f"when you want to generate the message."
+                )
+            except Exception as e:
+                reply = f"Couldn't save contact: {str(e)}"
+
+        # ── NETWORKING: GENERATE FOLLOW-UP MESSAGE ────────────────
+        elif action == "send_followup":
+            name_keyword = event_data.get("name", "")
+            event_name = event_data.get("event", "")
+            custom_note = event_data.get("custom_note", "")
+
+            # Find the contact
+            matches = search_contacts(name_keyword)
+
+            if not matches:
+                reply = (
+                    f"❌ Couldn't find a contact matching **{name_keyword}**.\n\n"
+                    f"Try saying the full name or say `/contacts` to see everyone."
+                )
+            else:
+                contact = matches[0]  # Use best match
+                cl.user_session.set("last_followup_contact", contact)
+
+                # Generate the personalised message
+                msg = generate_followup_message(
+                    contact=contact,
+                    event_name=event_name or contact.get("event", ""),
+                    custom_note=custom_note
+                )
+
+                cl.user_session.set("pending_followup_message", msg)
+                cl.user_session.set("pending_followup_contact_id", contact.get("id"))
+
+                reply = (
+                    f"✉️ Here's your follow-up message for **{contact.get('name')}**:\n\n"
+                    f"---\n\n"
+                    f"{msg}\n\n"
+                    f"---\n\n"
+                    f"📋 **Copy this message** and send it on WhatsApp or LinkedIn.\n\n"
+                    f"Say **sent it** once you've sent it and I'll mark it done. ✅"
+                )
+
+        # ── NETWORKING: VIEW CONTACTS ─────────────────────────────
+        elif action == "view_contacts":
+            keyword = event_data.get("keyword", "").strip()
+            if keyword:
+                matches = search_contacts(keyword)
+                reply = format_contacts_list(matches)
+                if matches:
+                    reply = f"🔍 Results for **'{keyword}'**:\n\n" + reply
+            else:
+                contacts = get_all_contacts()
+                reply = format_contacts_list(contacts)
+
+        # ── NETWORKING: MARK MESSAGE SENT ─────────────────────────
+        elif action == "mark_sent":
+            contact_id = event_data.get("contact_id", "")
+
+            # Fallback: use last pending contact id from session
+            if not contact_id:
+                contact_id = cl.user_session.get("pending_followup_contact_id", "")
+
+            if contact_id:
+                mark_message_sent(contact_id, platform="whatsapp/linkedin")
+                reply = (
+                    f"✅ Marked as sent! Great networking, Suriya 🤝\n\n"
+                    f"I've logged this follow-up in your contacts."
+                )
+            else:
+                reply = "✅ Got it — logged the follow-up. Keep it up! 🤝"
+
+    # Add reply to history and save
     history.append({
         "role": "assistant",
         "content": reply
     })
 
-    # Save updated history to session and disk
-    # Saving to disk means memory survives app restarts
     cl.user_session.set("history", history)
     save_history(user_id, history)
 
-    # Display the reply in the chat window
     await cl.Message(content=reply).send()

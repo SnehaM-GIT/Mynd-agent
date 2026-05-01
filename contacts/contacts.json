@@ -1,0 +1,18 @@
+[
+  {
+    "action": "save_contact",
+    "name": "Rajesh Kumar",
+    "role": "VP",
+    "company": "TechCorp",
+    "event": "Nasscom",
+    "phone": "",
+    "email": "",
+    "linkedin": "",
+    "notes": "",
+    "id": "c0001",
+    "saved_at": "2026-05-01T21:53:53.550634",
+    "message_sent": false,
+    "touchpoints": [],
+    "score": 25
+  }
+]

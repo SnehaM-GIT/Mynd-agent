@@ -5,3 +5,10 @@ token.json
 .env
 __pycache__/
 venv/
+DOCUMENTATION.md/
+FEATURE_MAP.md/
+IMPLEMENTATION.md/
+QUICKSTART.md/
+ROADMAP.MISSION.md/
+SUMMARY.md/
+
