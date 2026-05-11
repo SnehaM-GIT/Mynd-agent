@@ -585,7 +585,7 @@ def extract_contact_from_text(raw: str) -> dict:
     linkedin = re.search(r'linkedin\.com/in/[\w\-]+', raw, re.I)
     if linkedin: contact["linkedin"] = "https://" + linkedin.group()
 
-    insta = re.search(r'(?:instagram\.com/|@)([\w.]+)', raw, re.I)
-    if insta: contact["instagram"] = "@" + insta.group(1)
+    insta = re.search(r'instagram\.com/([\w.]+)|(?<![\w.])@([\w.]+)', raw, re.I)
+    if insta: contact["instagram"] = "@" + (insta.group(1) or insta.group(2))
 
     return contact

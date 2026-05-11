@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mynd Entrepreneur Agent</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="profile-panel">
+        <div class="brand-row">
+          <div class="brand-mark">M</div>
+          <div>
+            <p class="eyebrow">Mynd</p>
+            <h1>Entrepreneur Agent</h1>
+          </div>
+        </div>
+
+        <div class="completion-card">
+          <div class="completion-top">
+            <span>Profile completion</span>
+            <strong id="completionPercent">0%</strong>
+          </div>
+          <div class="progress-track">
+            <div id="completionBar" class="progress-bar"></div>
+          </div>
+          <p id="completionHint">Complete your profile once. Mynd will reuse it automatically.</p>
+        </div>
+
+        <form id="profileForm" class="profile-form">
+          <label>
+            Full name
+            <input name="name" autocomplete="name" placeholder="Suriya Jayan" />
+          </label>
+          <label>
+            Email
+            <input name="email" autocomplete="email" placeholder="you@company.com" />
+          </label>
+          <label>
+            Phone
+            <input name="phone" autocomplete="tel" placeholder="+91 98765 43210" />
+          </label>
+          <label>
+            University / company
+            <input name="university" placeholder="Anna University" />
+          </label>
+          <label>
+            Domains
+            <input name="domains" placeholder="chemical engineering, finance" />
+          </label>
+          <label>
+            Organization / network
+            <input name="org" placeholder="ITNT, incubator, fund, company" />
+          </label>
+          <label>
+            LinkedIn
+            <input name="linkedin" placeholder="https://linkedin.com/in/..." />
+          </label>
+          <label>
+            Instagram
+            <input name="instagram" placeholder="https://instagram.com/..." />
+          </label>
+          <label class="wide">
+            Value line
+            <textarea name="tagline" rows="3" placeholder="I help ambitious founders with..."></textarea>
+          </label>
+          <button type="submit" class="primary-button">Save profile</button>
+        </form>
+      </section>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div class="profile-chip">
+            <button id="avatarButton" class="avatar-button" type="button">M</button>
+            <div>
+              <p id="profileName">Set up your profile</p>
+              <span id="profileMeta">Saved locally with encrypted storage</span>
+            </div>
+          </div>
+          <button id="chatToggle" class="secondary-button" type="button">Open chat</button>
+        </header>
+
+        <section class="hero-band">
+          <div>
+            <p class="eyebrow">Personal operating layer</p>
+            <h2>Tell Mynd what needs to get done.</h2>
+            <p>
+              Save contacts after events, draft follow-ups, prepare application answers,
+              and keep your business profile ready without repeating yourself.
+            </p>
+          </div>
+        </section>
+
+        <section class="task-grid">
+          <button class="task-card" data-prompt="I met Rahul Sharma at Voko Run. He is a fintech founder at PayNow. His email is rahul@paynow.com">
+            <span>Networking</span>
+            <strong>Save a new event contact</strong>
+          </button>
+          <button class="task-card" data-prompt="Send Rahul a follow-up message">
+            <span>Follow-up</span>
+            <strong>Draft a warm message</strong>
+          </button>
+          <button class="task-card" data-prompt="Draft an application for a startup grant with fields: name, email, LinkedIn, startup name, city">
+            <span>Applications</span>
+            <strong>Prepare form answers</strong>
+          </button>
+          <button class="task-card" data-prompt="Show contacts from Voko Run">
+            <span>Contacts</span>
+            <strong>Review saved leads</strong>
+          </button>
+        </section>
+
+        <section class="profile-preview">
+          <div>
+            <p class="eyebrow">Saved profile</p>
+            <h3 id="previewTitle">No profile saved yet</h3>
+          </div>
+          <dl id="profilePreview"></dl>
+        </section>
+      </section>
+
+      <aside id="chatDrawer" class="chat-drawer open">
+        <div class="chat-header">
+          <div>
+            <p class="eyebrow">Mynd chat</p>
+            <h3>Ask naturally</h3>
+          </div>
+          <button id="chatClose" class="icon-button" type="button">×</button>
+        </div>
+        <div id="messages" class="messages"></div>
+        <form id="chatForm" class="chat-form">
+          <textarea id="chatInput" rows="2" placeholder="Tell Mynd what task you want done..."></textarea>
+          <button type="submit" class="send-button">Send</button>
+        </form>
+      </aside>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

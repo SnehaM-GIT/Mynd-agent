@@ -41,6 +41,14 @@ from microsoft_calendar_tool import (
     is_microsoft_connected,
     start_microsoft_device_login,
 )
+from application_tool import (
+    draft_application,
+    format_application_draft,
+    format_application_drafts,
+    format_vault_summary,
+    parse_private_info_updates,
+    save_private_info_updates,
+)
 
 load_dotenv()
 
@@ -109,6 +117,22 @@ When a user confirms they SENT a message (says "sent it", "done", "sent",
 
 {{"action": "mark_sent", "contact_id": "the id from pending contact"}}
 
+APPLICATION + PRIVATE INFO ACTIONS
+
+When a user asks you to remember private application, identity, founder,
+startup, company, tax, banking, or profile details for future forms,
+reply ONLY with this JSON:
+
+{{"action": "save_private_info", "fields": {{"startup_name": "value", "city": "value"}}}}
+
+When a user asks you to fill, prepare, draft, or answer an application
+or form using saved information, reply ONLY with this JSON:
+
+{{"action": "draft_application", "request": "the user's full request including form name and fields"}}
+
+Never invent private identity, business, tax, banking, or application data.
+Unknown fields should remain missing for the application draft.
+
 ════════════════════════════════════════════
 RULES
 ════════════════════════════════════════════
@@ -146,6 +170,65 @@ PROFILE_FIELDS = {
 }
 
 
+PROFILE_ONBOARDING_FIELDS = [
+    (
+        "name",
+        "What is your full name? This will appear in follow-up messages.",
+        True,
+    ),
+    (
+        "email",
+        "What email should Mynd use for applications and contact info? Type `skip` to leave it blank.",
+        False,
+    ),
+    (
+        "phone",
+        "What phone number should Mynd remember? Type `skip` to leave it blank.",
+        False,
+    ),
+    (
+        "university",
+        "University, company, or primary affiliation? Type `skip` if not relevant.",
+        False,
+    ),
+    (
+        "domains",
+        "What domains do you work in? Example: chemical engineering, finance, SaaS.",
+        False,
+    ),
+    (
+        "org",
+        "Any organization, incubator, investor network, or company to mention? Type `skip` if none.",
+        False,
+    ),
+    (
+        "linkedin",
+        "Paste your LinkedIn URL. Type `skip` if you do not want to add it now.",
+        False,
+    ),
+    (
+        "instagram",
+        "Paste your Instagram URL. Type `skip` if you do not want to add it now.",
+        False,
+    ),
+    (
+        "tagline",
+        "One short line about how you help people. This becomes your follow-up message value line.",
+        False,
+    ),
+]
+
+
+def get_current_user_id():
+    """
+    Stable local identity for this Mynd workspace.
+    For a real company deployment, set MYND_USER_ID per logged-in user.
+    """
+    raw = os.getenv("MYND_USER_ID") or os.getenv("MYND_WORKSPACE_ID") or "local_user"
+    user_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw.strip())
+    return user_id or "local_user"
+
+
 def parse_profile_updates(command_text):
     body = re.sub(r"^/profile\s*(set)?", "", command_text, flags=re.I).strip()
     if not body:
@@ -169,6 +252,78 @@ def parse_profile_updates(command_text):
     return updates
 
 
+def get_ask_output(answer):
+    if not answer:
+        return ""
+    if isinstance(answer, dict):
+        return str(answer.get("output", "")).strip()
+    return str(answer).strip()
+
+
+async def run_profile_onboarding(user_id, force=False):
+    profile = load_user_profile(user_id)
+    updates = {}
+
+    intro = (
+        "Let's set up your profile once so Mynd can personalize follow-ups, "
+        "applications, and calendar messages. Your answers are saved locally "
+        "in encrypted storage.\n\n"
+        "You can type `skip` for optional fields."
+    )
+    if force:
+        intro = "Let's update your saved Mynd profile.\n\n" + intro
+    await cl.Message(content=intro).send()
+
+    for key, prompt, required in PROFILE_ONBOARDING_FIELDS:
+        existing = str(profile.get(key, "") or "").strip()
+        if existing and not force:
+            continue
+
+        label = prompt
+        if existing:
+            label += f"\n\nCurrent value: `{existing}`"
+
+        answer = await cl.AskUserMessage(
+            content=label,
+            timeout=300,
+            raise_on_timeout=False,
+        ).send()
+        value = get_ask_output(answer)
+
+        if value.lower() in ["skip", ""]:
+            if required and not existing:
+                await cl.Message(
+                    content="Name is required so your messages do not look generic. You can run `/setup` later."
+                ).send()
+                continue
+            continue
+
+        updates[key] = value
+
+    if updates:
+        profile.update(updates)
+
+    profile["setup_complete"] = bool(profile.get("name")) and bool(
+        profile.get("linkedin") or profile.get("instagram") or profile.get("email")
+    )
+    save_user_profile(user_id, profile)
+
+    if profile["setup_complete"]:
+        await cl.Message(
+            content="Profile setup complete.\n\n" + format_profile_card(profile)
+        ).send()
+    else:
+        await cl.Message(
+            content=(
+                "Profile saved, but it is not complete yet. Add at least your name "
+                "and one contact link/email when you are ready.\n\n"
+                + format_profile_card(profile)
+            )
+        ).send()
+
+    return profile
+
+
 def calendar_provider_from(event_data, message_text, session_provider):
     provider = (event_data or {}).get("provider", "") or session_provider or "google"
     text = f"{message_text} {json.dumps(event_data or {})}".lower()
@@ -181,6 +336,104 @@ def calendar_provider_from(event_data, message_text, session_provider):
 
 def calendar_label(provider):
     return "Microsoft Calendar" if provider == "microsoft" else "Google Calendar"
+
+
+def parse_local_text_action(text):
+    """Cheap deterministic parser for the most common text workflows."""
+    clean = text.strip()
+    lower = clean.lower()
+
+    if lower in ["sent it", "done", "sent", "i sent it"]:
+        return {"action": "mark_sent", "contact_id": ""}
+
+    followup_match = re.search(
+        r"\b(?:send|write|draft|generate)\s+(?:a\s+)?(?:follow[- ]?up\s+)?(?:message\s+)?(?:to|for)\s+([a-z][\w .'-]+)",
+        clean,
+        re.I,
+    )
+    if not followup_match:
+        followup_match = re.search(
+            r"\b(?:send|write|draft|generate)\s+([a-z][\w .'-]+?)\s+(?:a\s+)?follow[- ]?up(?:\s+message)?\b",
+            clean,
+            re.I,
+        )
+    if not followup_match:
+        followup_match = re.search(
+            r"\b(?:send|write|draft|generate)\s+([a-z][\w .'-]+?)\s+(?:a\s+)?message\b",
+            clean,
+            re.I,
+        )
+    if followup_match:
+        name = followup_match.group(1).strip(" .")
+        name = re.sub(r"\s+(?:on|via)\s+(?:whatsapp|linkedin|email).*", "", name, flags=re.I)
+        return {
+            "action": "send_followup",
+            "name": name,
+            "event": "",
+            "custom_note": "",
+        }
+
+    if any(phrase in lower for phrase in ["show contacts", "see contacts", "list contacts", "view contacts"]):
+        keyword = ""
+        from_match = re.search(r"\bfrom\s+(.+)$", clean, re.I)
+        if from_match:
+            keyword = from_match.group(1).strip(" .")
+        return {"action": "view_contacts", "keyword": keyword}
+
+    contact = parse_manual_contact(clean)
+    if contact:
+        contact["action"] = "save_contact"
+        return contact
+
+    return None
+
+
+def parse_manual_contact(text):
+    lower = text.lower()
+    if "met " not in lower and "meet " not in lower:
+        return None
+
+    contact = extract_contact_from_text(text)
+
+    name_match = re.search(
+        r"\b(?:i\s+)?met\s+([A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,3})",
+        text,
+    )
+    if name_match:
+        contact["name"] = name_match.group(1).strip()
+
+    event_match = re.search(
+        r"\bat\s+([^.,\n]+?)(?:\s+(?:he|she|they|who|and)\b|[.,\n]|$)",
+        text,
+        re.I,
+    )
+    if event_match:
+        contact["event"] = event_match.group(1).strip()
+
+    role_company_match = re.search(
+        r"\b(?:he|she|they)\s+(?:is|was|are)\s+(?:a|an)?\s*(.+?)\s+(?:at|from|with)\s+([A-Z][\w &-]+?)(?:[.,\n]|$)",
+        text,
+        re.I,
+    )
+    if role_company_match:
+        contact["role"] = role_company_match.group(1).strip(" .")
+        contact["company"] = role_company_match.group(2).strip(" .")
+
+    founder_match = re.search(r"\bfounder\s+at\s+([A-Z][\w &-]+?)(?:[.,\n]|$)", text, re.I)
+    if founder_match and not contact.get("role"):
+        contact["role"] = "founder"
+        contact["company"] = founder_match.group(1).strip(" .")
+
+    if contact.get("name"):
+        contact.setdefault("role", "")
+        contact.setdefault("company", "")
+        contact.setdefault("event", "")
+        contact.setdefault("phone", "")
+        contact.setdefault("email", "")
+        contact.setdefault("linkedin", "")
+        contact["notes"] = text
+        return contact
+    return None
 
 
 def provider_check_conflicts(provider, user_id, date_input, time_input, duration_minutes):
@@ -275,8 +528,7 @@ async def extract_contact_from_image(image_bytes: bytes, mime_type: str) -> dict
 async def start():
     from networking_tool import is_profile_setup, load_user_profile
     
-    session_id = cl.user_session.get("id")
-    user_id = str(session_id)
+    user_id = get_current_user_id()
     cl.user_session.set("user_id", user_id)
     cl.user_session.set("calendar_provider", "google")
 
@@ -285,6 +537,10 @@ async def start():
 
     # Check if user profile is set up
     profile_setup = is_profile_setup(user_id)
+
+    if not profile_setup:
+        await run_profile_onboarding(user_id)
+        profile_setup = is_profile_setup(user_id)
     
     if history:
         greeting = "Welcome back! I'm **Mynd** 🚀\n\n"
@@ -340,10 +596,25 @@ async def main(message: cl.Message):
     if history is None:
         history = []
     if user_id is None:
-        user_id = "default"
+        user_id = get_current_user_id()
+        cl.user_session.set("user_id", user_id)
 
     text = message.content.strip()
     lower_text = text.lower()
+
+    if lower_text in ["/setup", "/onboarding"]:
+        await run_profile_onboarding(user_id, force=True)
+        return
+
+    if lower_text == "/whoami":
+        profile = load_user_profile(user_id)
+        await cl.Message(
+            content=(
+                f"Workspace user: `{user_id}`\n\n"
+                f"{format_profile_card(profile)}"
+            )
+        ).send()
+        return
 
     if cl.user_session.get("awaiting_microsoft_login") and lower_text in ["done", "yes", "connected"]:
         flow = cl.user_session.get("microsoft_device_flow")
@@ -382,6 +653,32 @@ async def main(message: cl.Message):
 
     if lower_text == "/brief":
         await cl.Message(content=generate_daily_brief(user_id=user_id)).send()
+        return
+
+    if lower_text == "/vault reveal":
+        await cl.Message(content=format_vault_summary(user_id=user_id, reveal=True)).send()
+        return
+
+    if lower_text.startswith("/vault"):
+        updates = parse_private_info_updates(text)
+        if updates:
+            count = save_private_info_updates(user_id, updates)
+            content = (
+                f"Saved {count} private field(s) to the encrypted vault.\n\n"
+                + format_vault_summary(user_id=user_id)
+            )
+        else:
+            content = format_vault_summary(user_id=user_id)
+        await cl.Message(content=content).send()
+        return
+
+    if lower_text == "/applications":
+        await cl.Message(content=format_application_drafts(user_id=user_id)).send()
+        return
+
+    if lower_text.startswith("/application"):
+        draft = draft_application(user_id, text)
+        await cl.Message(content=format_application_draft(draft)).send()
         return
 
     if lower_text == "/importlegacydata":
@@ -639,33 +936,44 @@ async def main(message: cl.Message):
         "content": message.content
     })
 
-    full_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ] + history
+    event_data = parse_local_text_action(message.content)
+    reply = ""
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        max_tokens=700,
-        messages=full_messages
-    )
+    if not event_data:
+        full_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ] + history
 
-    reply = response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                max_tokens=700,
+                messages=full_messages
+            )
+            reply = response.choices[0].message.content.strip()
+        except Exception as e:
+            reply = (
+                "I received your message, but the AI routing call failed before "
+                f"I could act on it: {str(e)}\n\n"
+                "Try a direct command like `/contacts`, `/profile`, or "
+                "`/vault set startup_name=...` while I recover."
+            )
 
-    # Try to parse JSON action from Groq reply
-    event_data = None
-    try:
-        json_start = reply.find("{")
-        json_end = reply.rfind("}") + 1
-        if json_start != -1 and json_end > json_start:
-            json_str = reply[json_start:json_end]
-            parsed = json.loads(json_str)
-            if parsed.get("action") in [
-                "create_event", "delete_event", "view_events",
-                "save_contact", "send_followup", "view_contacts", "mark_sent"
-            ]:
-                event_data = parsed
-    except json.JSONDecodeError:
-        pass
+        # Try to parse JSON action from Groq reply
+        try:
+            json_start = reply.find("{")
+            json_end = reply.rfind("}") + 1
+            if json_start != -1 and json_end > json_start:
+                json_str = reply[json_start:json_end]
+                parsed = json.loads(json_str)
+                if parsed.get("action") in [
+                    "create_event", "delete_event", "view_events",
+                    "save_contact", "send_followup", "view_contacts", "mark_sent",
+                    "save_private_info", "draft_application"
+                ]:
+                    event_data = parsed
+        except json.JSONDecodeError:
+            pass
 
     if event_data:
         action = event_data.get("action")
@@ -878,6 +1186,25 @@ async def main(message: cl.Message):
                 )
             else:
                 reply = "✅ Got it — logged the follow-up. Keep it up! 🤝"
+
+        elif action == "save_private_info":
+            fields = event_data.get("fields", {})
+            if isinstance(fields, dict) and fields:
+                count = save_private_info_updates(user_id, fields)
+                reply = (
+                    f"Saved {count} private field(s) to the encrypted vault.\n\n"
+                    f"{format_vault_summary(user_id=user_id)}"
+                )
+            else:
+                reply = (
+                    "I could not find specific fields to save. Use this format:\n"
+                    "`/vault set startup_name=Acme Labs | city=Chennai`"
+                )
+
+        elif action == "draft_application":
+            request_text = event_data.get("request") or message.content
+            draft = draft_application(user_id, request_text)
+            reply = format_application_draft(draft)
 
     # Add reply to history and save
     history.append({
