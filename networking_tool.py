@@ -18,6 +18,7 @@ import os
 import json
 import datetime
 import re
+import storage_tool
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 CONTACTS_DIR = "contacts"
@@ -26,6 +27,7 @@ os.makedirs(CONTACTS_DIR, exist_ok=True)
 os.makedirs(PROFILES_DIR, exist_ok=True)
 CONTACTS_FILE = os.path.join(CONTACTS_DIR, "contacts.json")
 PROFILE_FILE  = os.path.join(CONTACTS_DIR, "my_profile.json")  # Legacy global
+DEFAULT_USER_ID = "default"
 
 
 # ── EMPTY PROFILE TEMPLATE (Users must fill this) ─────────────────────────────
@@ -52,13 +54,19 @@ def get_user_profile_path(user_id: str) -> str:
 
 def load_user_profile(user_id: str) -> dict:
     """Load user's personal profile. Returns empty if not set up yet."""
+    stored_profile = storage_tool.load_profile(user_id)
+    if stored_profile:
+        return stored_profile
+
     profile_path = get_user_profile_path(user_id)
     if os.path.exists(profile_path):
         with open(profile_path) as f:
-            return json.load(f)
+            profile = json.load(f)
+            storage_tool.save_profile(user_id, profile)
+            return profile
     
-    # Check legacy global profile
-    if os.path.exists(PROFILE_FILE):
+    # Legacy global profile is imported only for the compatibility user.
+    if user_id == DEFAULT_USER_ID and os.path.exists(PROFILE_FILE):
         with open(PROFILE_FILE) as f:
             global_profile = json.load(f)
             # Migrate to per-user
@@ -70,9 +78,7 @@ def load_user_profile(user_id: str) -> dict:
 
 def save_user_profile(user_id: str, profile: dict):
     """Save user's personal profile"""
-    profile_path = get_user_profile_path(user_id)
-    with open(profile_path, "w") as f:
-        json.dump(profile, f, indent=2)
+    storage_tool.save_profile(user_id, profile)
 
 
 def is_profile_setup(user_id: str) -> bool:
@@ -98,16 +104,21 @@ def profile_setup_status(user_id: str) -> dict:
 
 def load_profile() -> dict:
     """Legacy function for backward compatibility"""
+    stored_profile = storage_tool.load_profile(DEFAULT_USER_ID)
+    if stored_profile:
+        return stored_profile
+
     if os.path.exists(PROFILE_FILE):
         with open(PROFILE_FILE) as f:
-            return json.load(f)
+            profile = json.load(f)
+            storage_tool.save_profile(DEFAULT_USER_ID, profile)
+            return profile
     return EMPTY_PROFILE.copy()
 
 
 def save_profile(profile: dict):
     """Legacy function - save global profile"""
-    with open(PROFILE_FILE, "w") as f:
-        json.dump(profile, f, indent=2)
+    storage_tool.save_profile(DEFAULT_USER_ID, profile)
 
 
 def update_profile_field(key: str, value: str, user_id: str = None) -> dict:
@@ -145,28 +156,55 @@ def format_profile_card(profile: dict) -> str:
 
 # ── Contact storage ────────────────────────────────────────────────────────────
 
-def load_contacts() -> list:
-    if os.path.exists(CONTACTS_FILE):
+def load_contacts(user_id: str = DEFAULT_USER_ID) -> list:
+    contacts = storage_tool.load_contacts(user_id)
+    if contacts:
+        return contacts
+
+    if user_id == DEFAULT_USER_ID and os.path.exists(CONTACTS_FILE):
         with open(CONTACTS_FILE) as f:
-            return json.load(f)
+            legacy_contacts = json.load(f)
+        storage_tool.save_contacts(user_id, legacy_contacts)
+        return legacy_contacts
     return []
 
 
-def save_contacts(contacts: list):
-    with open(CONTACTS_FILE, "w") as f:
-        json.dump(contacts, f, indent=2)
+def import_legacy_data(user_id: str) -> dict:
+    imported_profile = False
+    imported_contacts = 0
+
+    if os.path.exists(PROFILE_FILE):
+        with open(PROFILE_FILE) as f:
+            save_user_profile(user_id, json.load(f))
+            imported_profile = True
+
+    if os.path.exists(CONTACTS_FILE):
+        with open(CONTACTS_FILE) as f:
+            contacts = json.load(f)
+        for contact in contacts:
+            add_contact(contact.copy(), user_id=user_id)
+        imported_contacts = len(contacts)
+
+    return {
+        "profile": imported_profile,
+        "contacts": imported_contacts,
+    }
 
 
-def _next_id(contacts: list) -> str:
-    return f"c{len(contacts) + 1:04d}"
+def save_contacts(contacts: list, user_id: str = DEFAULT_USER_ID):
+    storage_tool.save_contacts(user_id, contacts)
 
 
-def add_contact(contact_data: dict) -> dict:
+def _next_id(contacts: list, user_id: str = DEFAULT_USER_ID) -> str:
+    return storage_tool.next_contact_id(user_id)
+
+
+def add_contact(contact_data: dict, user_id: str = DEFAULT_USER_ID) -> dict:
     """
     Save a new contact or update existing (matched by name + event).
     Auto-computes follow-up score on save.
     """
-    contacts = load_contacts()
+    contacts = load_contacts(user_id)
     name  = contact_data.get("name", "").strip().lower()
     event = contact_data.get("event", "").strip().lower()
 
@@ -176,22 +214,22 @@ def add_contact(contact_data: dict) -> dict:
             contacts[i].update(contact_data)
             contacts[i]["updated_at"] = datetime.datetime.now().isoformat()
             contacts[i]["score"] = _compute_score(contacts[i])
-            save_contacts(contacts)
+            save_contacts(contacts, user_id)
             return contacts[i]
 
-    contact_data["id"]            = _next_id(contacts)
+    contact_data["id"]            = _next_id(contacts, user_id)
     contact_data["saved_at"]      = datetime.datetime.now().isoformat()
     contact_data["message_sent"]  = False
     contact_data["touchpoints"]   = []          # list of follow-up notes
     contact_data["score"]         = _compute_score(contact_data)
     contacts.append(contact_data)
-    save_contacts(contacts)
+    save_contacts(contacts, user_id)
     return contact_data
 
 
-def add_touchpoint(contact_id: str, note: str):
+def add_touchpoint(contact_id: str, note: str, user_id: str = DEFAULT_USER_ID):
     """Log a new interaction with a contact (call, reply, meeting etc.)"""
-    contacts = load_contacts()
+    contacts = load_contacts(user_id)
     for c in contacts:
         if c.get("id") == contact_id:
             if "touchpoints" not in c:
@@ -201,14 +239,14 @@ def add_touchpoint(contact_id: str, note: str):
                 "at": datetime.datetime.now().isoformat()
             })
             c["score"] = _compute_score(c)
-            save_contacts(contacts)
+            save_contacts(contacts, user_id)
             return c
     return None
 
 
-def search_contacts(keyword: str) -> list:
+def search_contacts(keyword: str, user_id: str = DEFAULT_USER_ID) -> list:
     """Full-text search across all contact fields."""
-    contacts = load_contacts()
+    contacts = load_contacts(user_id)
     kw = keyword.lower()
     return [
         c for c in contacts
@@ -219,23 +257,23 @@ def search_contacts(keyword: str) -> list:
     ]
 
 
-def get_all_contacts() -> list:
-    return load_contacts()
+def get_all_contacts(user_id: str = DEFAULT_USER_ID) -> list:
+    return load_contacts(user_id)
 
 
-def get_contacts_by_event(event_name: str) -> list:
-    contacts = load_contacts()
+def get_contacts_by_event(event_name: str, user_id: str = DEFAULT_USER_ID) -> list:
+    contacts = load_contacts(user_id)
     ev = event_name.lower()
     return [c for c in contacts if ev in c.get("event", "").lower()]
 
 
-def get_unsent_contacts(days_threshold: int = 3) -> list:
+def get_unsent_contacts(days_threshold: int = 3, user_id: str = DEFAULT_USER_ID) -> list:
     """
     Return contacts where message_sent is False AND
     they were saved more than `days_threshold` days ago.
     These are the 'forgotten' leads.
     """
-    contacts = load_contacts()
+    contacts = load_contacts(user_id)
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days_threshold)
     results = []
     for c in contacts:
@@ -250,15 +288,15 @@ def get_unsent_contacts(days_threshold: int = 3) -> list:
     return results
 
 
-def mark_message_sent(contact_id: str, platform: str = "whatsapp"):
-    contacts = load_contacts()
+def mark_message_sent(contact_id: str, platform: str = "whatsapp", user_id: str = DEFAULT_USER_ID):
+    contacts = load_contacts(user_id)
     for c in contacts:
         if c.get("id") == contact_id:
             c["message_sent"]    = True
             c["message_sent_at"] = datetime.datetime.now().isoformat()
             c["message_platform"] = platform
             c["score"]           = _compute_score(c)
-    save_contacts(contacts)
+    save_contacts(contacts, user_id)
 
 
 # ── Follow-up scoring ──────────────────────────────────────────────────────────
@@ -306,9 +344,9 @@ def _compute_score(contact: dict) -> int:
     return max(0, min(100, score))
 
 
-def get_priority_contacts(top_n: int = 5) -> list:
+def get_priority_contacts(top_n: int = 5, user_id: str = DEFAULT_USER_ID) -> list:
     """Return top N contacts sorted by follow-up score descending."""
-    contacts = load_contacts()
+    contacts = load_contacts(user_id)
     # Recompute scores fresh
     for c in contacts:
         c["score"] = _compute_score(c)
@@ -451,8 +489,8 @@ def generate_followup_message(
 
 # ── Analytics ──────────────────────────────────────────────────────────────────
 
-def get_networking_stats() -> dict:
-    contacts = load_contacts()
+def get_networking_stats(user_id: str = DEFAULT_USER_ID) -> dict:
+    contacts = load_contacts(user_id)
     total    = len(contacts)
     sent     = sum(1 for c in contacts if c.get("message_sent"))
     unsent   = total - sent
@@ -471,8 +509,8 @@ def get_networking_stats() -> dict:
     }
 
 
-def format_networking_stats() -> str:
-    s = get_networking_stats()
+def format_networking_stats(user_id: str = DEFAULT_USER_ID) -> str:
+    s = get_networking_stats(user_id)
     if s["total"] == 0:
         return "📭 No contacts saved yet. Start by telling me who you met!"
 

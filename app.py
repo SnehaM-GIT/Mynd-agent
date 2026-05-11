@@ -27,6 +27,7 @@ from networking_tool import (
     format_profile_card,
     load_user_profile,
     save_user_profile,
+    import_legacy_data,
 )
 from daily_brief import generate_daily_brief
 from microsoft_calendar_tool import (
@@ -319,6 +320,7 @@ async def start():
             "`/microsoftcalendar` — connect Outlook/Microsoft Calendar\n"
             "`/stats` — networking stats\n"
             "`/brief` — daily brief\n"
+            "`/importlegacydata` — import old local JSON profile/contacts\n"
             "`/switchaccount` — connect a different Google account\n"
             "`/clearhistory` — reset conversation memory\n"
             "`/contacts` — show all saved contacts\n"
@@ -375,11 +377,22 @@ async def main(message: cl.Message):
         return
 
     if lower_text == "/stats":
-        await cl.Message(content=format_networking_stats()).send()
+        await cl.Message(content=format_networking_stats(user_id=user_id)).send()
         return
 
     if lower_text == "/brief":
-        await cl.Message(content=generate_daily_brief()).send()
+        await cl.Message(content=generate_daily_brief(user_id=user_id)).send()
+        return
+
+    if lower_text == "/importlegacydata":
+        result = import_legacy_data(user_id)
+        await cl.Message(
+            content=(
+                "Legacy JSON import complete.\n\n"
+                f"Profile imported: {'yes' if result['profile'] else 'no'}\n"
+                f"Contacts imported: {result['contacts']}"
+            )
+        ).send()
         return
 
     if lower_text == "/usegoogle":
@@ -485,7 +498,7 @@ async def main(message: cl.Message):
 
     # ── COMMAND: /contacts ────────────────────────────────────────
     if message.content.strip().lower() == "/contacts":
-        contacts = get_all_contacts()
+        contacts = get_all_contacts(user_id=user_id)
         await cl.Message(content=format_contacts_list(contacts)).send()
         return
 
@@ -596,7 +609,7 @@ async def main(message: cl.Message):
 
         if user_input.upper() == "SAVE":
             # Save without adding event name
-            saved = add_contact(pending)
+            saved = add_contact(pending, user_id=user_id)
             cl.user_session.set("awaiting_contact_confirm", False)
             cl.user_session.set("last_saved_contact", saved)
             await cl.Message(
@@ -608,7 +621,7 @@ async def main(message: cl.Message):
         else:
             # User typed event name
             pending["event"] = user_input
-            saved = add_contact(pending)
+            saved = add_contact(pending, user_id=user_id)
             cl.user_session.set("awaiting_contact_confirm", False)
             cl.user_session.set("last_saved_contact", saved)
             await cl.Message(
@@ -788,7 +801,7 @@ async def main(message: cl.Message):
         # ── NETWORKING: SAVE CONTACT ──────────────────────────────
         elif action == "save_contact":
             try:
-                saved = add_contact(event_data)
+                saved = add_contact(event_data, user_id=user_id)
                 cl.user_session.set("last_saved_contact", saved)
                 reply = (
                     f"✅ Contact saved!\n\n"
@@ -806,7 +819,7 @@ async def main(message: cl.Message):
             custom_note = event_data.get("custom_note", "")
 
             # Find the contact
-            matches = search_contacts(name_keyword)
+            matches = search_contacts(name_keyword, user_id=user_id)
 
             if not matches:
                 reply = (
@@ -841,12 +854,12 @@ async def main(message: cl.Message):
         elif action == "view_contacts":
             keyword = event_data.get("keyword", "").strip()
             if keyword:
-                matches = search_contacts(keyword)
+                matches = search_contacts(keyword, user_id=user_id)
                 reply = format_contacts_list(matches)
                 if matches:
                     reply = f"🔍 Results for **'{keyword}'**:\n\n" + reply
             else:
-                contacts = get_all_contacts()
+                contacts = get_all_contacts(user_id=user_id)
                 reply = format_contacts_list(contacts)
 
         # ── NETWORKING: MARK MESSAGE SENT ─────────────────────────
@@ -858,7 +871,7 @@ async def main(message: cl.Message):
                 contact_id = cl.user_session.get("pending_followup_contact_id", "")
 
             if contact_id:
-                mark_message_sent(contact_id, platform="whatsapp/linkedin")
+                mark_message_sent(contact_id, platform="whatsapp/linkedin", user_id=user_id)
                 reply = (
                     f"✅ Marked as sent! Great networking, Suriya 🤝\n\n"
                     f"I've logged this follow-up in your contacts."

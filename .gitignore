@@ -1,6 +1,10 @@
 tokens/
 histories/
 contacts/profiles/
+contacts/*.json
+!contacts/*.example.json
+data/
+data/.secret.key
 credentials.json
 token.json
 .env

@@ -23,7 +23,7 @@ from networking_tool import (
 )
 
 
-def generate_daily_brief(calendar_events: list = None) -> str:
+def generate_daily_brief(calendar_events: list = None, user_id: str = "default") -> str:
     """
     calendar_events: list of Google Calendar event dicts for today
     (already fetched from calendar_tool.get_events — pass raw items list)
@@ -56,10 +56,10 @@ def generate_daily_brief(calendar_events: list = None) -> str:
     lines.append("")
 
     # ── Networking section ─────────────────────────────────────────
-    unsent = get_unsent_contacts(days_threshold=0)   # all unsent, any age
-    stale  = get_unsent_contacts(days_threshold=3)   # unsent for 3+ days
-    top    = get_priority_contacts(top_n=3)
-    stats  = get_networking_stats()
+    unsent = get_unsent_contacts(days_threshold=0, user_id=user_id)
+    stale  = get_unsent_contacts(days_threshold=3, user_id=user_id)
+    top    = get_priority_contacts(top_n=3, user_id=user_id)
+    stats  = get_networking_stats(user_id=user_id)
 
     lines.append("## 🤝 Networking Priorities")
 
