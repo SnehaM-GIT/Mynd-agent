@@ -443,14 +443,10 @@ def generate_followup_message(
         
         return (f"SUBJECT: {subject}\n\n{body}", True, [])
 
-    # Fallback
-    return (generate_followup_message(contact, event_name, custom_note, "whatsapp", user_id), True, [])
-            f"Instagram: {profile['instagram']}"
-        )
-        return f"SUBJECT: {subject}\n\n{body}"
-
-    # Fallback
-    return generate_followup_message(contact, event_name, custom_note, "whatsapp")
+    # Fallback to the default WhatsApp style.
+    return generate_followup_message(
+        contact, event_name, custom_note, "whatsapp", user_id
+    )
 
 
 # ── Analytics ──────────────────────────────────────────────────────────────────

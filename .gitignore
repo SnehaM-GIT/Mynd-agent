@@ -1,5 +1,6 @@
 tokens/
 histories/
+contacts/profiles/
 credentials.json
 token.json
 .env

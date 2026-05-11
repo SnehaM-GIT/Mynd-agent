@@ -23,6 +23,22 @@ from networking_tool import (
     format_contacts_list,
     mark_message_sent,
     extract_contact_from_text,
+    format_networking_stats,
+    format_profile_card,
+    load_user_profile,
+    save_user_profile,
+)
+from daily_brief import generate_daily_brief
+from microsoft_calendar_tool import (
+    MicrosoftCalendarNotConnected,
+    check_microsoft_conflicts,
+    clear_microsoft_token,
+    create_microsoft_calendar_event,
+    delete_microsoft_calendar_event,
+    finish_microsoft_device_login,
+    get_microsoft_events,
+    is_microsoft_connected,
+    start_microsoft_device_login,
 )
 
 load_dotenv()
@@ -49,20 +65,23 @@ CALENDAR ACTIONS
 When a user wants to CREATE, SCHEDULE, BLOCK, SET, or ADD a calendar
 event, meeting, reminder, or call — reply ONLY with this exact JSON:
 
-{{"action": "create_event", "title": "event name", "date": "as user said", "time": "as user said or empty string if not mentioned", "duration": "as user said or 1 hour if not mentioned", "reminder": 30, "recurrence": null}}
+{{"action": "create_event", "title": "event name", "date": "as user said", "time": "as user said or empty string if not mentioned", "duration": "as user said or 1 hour if not mentioned", "reminder": 30, "recurrence": null, "provider": "google"}}
+
+Use provider "microsoft" when the user says Microsoft, Outlook, or Office 365
+calendar. Otherwise use "google".
 
 For RECURRING events like "every monday", "every week", "daily standup",
 "every month" — include recurrence like this:
 
-{{"action": "create_event", "title": "event name", "date": "as user said", "time": "as user said", "duration": "1 hour", "reminder": 30, "recurrence": {{"frequency": "weekly", "count": 10}}}}
+{{"action": "create_event", "title": "event name", "date": "as user said", "time": "as user said", "duration": "1 hour", "reminder": 30, "recurrence": {{"frequency": "weekly", "count": 10}}, "provider": "google"}}
 
 recurrence frequency must be: "daily", "weekly", or "monthly"
 
 When a user wants to DELETE, REMOVE, or CANCEL an event:
-{{"action": "delete_event", "title": "event keyword", "date": "as user said"}}
+{{"action": "delete_event", "title": "event keyword", "date": "as user said", "provider": "google"}}
 
 When a user wants to VIEW their calendar for a day:
-{{"action": "view_events", "date": "as user said"}}
+{{"action": "view_events", "date": "as user said", "provider": "google"}}
 
 ════════════════════════════════════════════
 NETWORKING ACTIONS
@@ -118,6 +137,82 @@ def save_history(user_id, history):
     path = get_history_path(user_id)
     with open(path, "w") as f:
         json.dump(history, f)
+
+
+PROFILE_FIELDS = {
+    "name", "email", "phone", "university", "domains",
+    "org", "linkedin", "instagram", "tagline",
+}
+
+
+def parse_profile_updates(command_text):
+    body = re.sub(r"^/profile\s*(set)?", "", command_text, flags=re.I).strip()
+    if not body:
+        return {}
+
+    updates = {}
+    parts = re.split(r"\s*\|\s*|\n+", body)
+    for part in parts:
+        if not part.strip():
+            continue
+        if "=" in part:
+            key, value = part.split("=", 1)
+        elif ":" in part:
+            key, value = part.split(":", 1)
+        else:
+            continue
+        key = key.strip().lower()
+        value = value.strip()
+        if key in PROFILE_FIELDS and value:
+            updates[key] = value
+    return updates
+
+
+def calendar_provider_from(event_data, message_text, session_provider):
+    provider = (event_data or {}).get("provider", "") or session_provider or "google"
+    text = f"{message_text} {json.dumps(event_data or {})}".lower()
+    if any(word in text for word in ["microsoft", "outlook", "office 365", "office365"]):
+        provider = "microsoft"
+    if "google" in text:
+        provider = "google"
+    return "microsoft" if provider == "microsoft" else "google"
+
+
+def calendar_label(provider):
+    return "Microsoft Calendar" if provider == "microsoft" else "Google Calendar"
+
+
+def provider_check_conflicts(provider, user_id, date_input, time_input, duration_minutes):
+    if provider == "microsoft":
+        return check_microsoft_conflicts(user_id, date_input, time_input, duration_minutes)
+    return check_conflicts(user_id, date_input, time_input, duration_minutes)
+
+
+def provider_create_event(provider, user_id, event_data, duration_minutes):
+    kwargs = dict(
+        user_id=user_id,
+        title=event_data["title"],
+        date_input=event_data["date"],
+        time_input=event_data["time"],
+        duration_minutes=duration_minutes,
+        reminder_minutes=int(event_data.get("reminder", 30)),
+        recurrence=event_data.get("recurrence"),
+    )
+    if provider == "microsoft":
+        return create_microsoft_calendar_event(**kwargs)
+    return create_calendar_event(**kwargs)
+
+
+def provider_delete_event(provider, user_id, title_keyword, date_input):
+    if provider == "microsoft":
+        return delete_microsoft_calendar_event(user_id, title_keyword, date_input)
+    return delete_calendar_event(user_id, title_keyword, date_input)
+
+
+def provider_get_events(provider, user_id, date_input):
+    if provider == "microsoft":
+        return get_microsoft_events(user_id, date_input)
+    return get_events(user_id, date_input)
 
 
 # ── IMAGE → TEXT via Groq vision ─────────────────────────────────────────────
@@ -182,6 +277,7 @@ async def start():
     session_id = cl.user_session.get("id")
     user_id = str(session_id)
     cl.user_session.set("user_id", user_id)
+    cl.user_session.set("calendar_provider", "google")
 
     history = load_history(user_id)
     cl.user_session.set("history", history)
@@ -219,6 +315,10 @@ async def start():
             "- *Upload a business card photo and I'll save it automatically*\n\n"
             "**Commands:**\n"
             "`/profile` — set up your personal details\n"
+            "`/usegoogle` / `/usemicrosoft` — choose calendar provider\n"
+            "`/microsoftcalendar` — connect Outlook/Microsoft Calendar\n"
+            "`/stats` — networking stats\n"
+            "`/brief` — daily brief\n"
             "`/switchaccount` — connect a different Google account\n"
             "`/clearhistory` — reset conversation memory\n"
             "`/contacts` — show all saved contacts\n"
@@ -240,8 +340,121 @@ async def main(message: cl.Message):
     if user_id is None:
         user_id = "default"
 
+    text = message.content.strip()
+    lower_text = text.lower()
+
+    if cl.user_session.get("awaiting_microsoft_login") and lower_text in ["done", "yes", "connected"]:
+        flow = cl.user_session.get("microsoft_device_flow")
+        try:
+            connected, result_message = finish_microsoft_device_login(user_id, flow)
+        except Exception as e:
+            connected, result_message = False, f"Microsoft login error: {str(e)}"
+        if connected:
+            cl.user_session.set("awaiting_microsoft_login", False)
+            cl.user_session.set("microsoft_device_flow", None)
+            cl.user_session.set("calendar_provider", "microsoft")
+        await cl.Message(content=result_message).send()
+        return
+
+    if lower_text.startswith("/profile"):
+        updates = parse_profile_updates(text)
+        profile = load_user_profile(user_id)
+        if updates:
+            profile.update(updates)
+            profile["setup_complete"] = True
+            save_user_profile(user_id, profile)
+            content = "Profile updated.\n\n" + format_profile_card(profile)
+        else:
+            content = (
+                format_profile_card(profile)
+                + "\n\nUpdate it like this:\n"
+                + "`/profile name=Suriya Jayan | linkedin=https://... | "
+                + "instagram=https://... | domains=chemical engineering and finance`"
+            )
+        await cl.Message(content=content).send()
+        return
+
+    if lower_text == "/stats":
+        await cl.Message(content=format_networking_stats()).send()
+        return
+
+    if lower_text == "/brief":
+        await cl.Message(content=generate_daily_brief()).send()
+        return
+
+    if lower_text == "/usegoogle":
+        cl.user_session.set("calendar_provider", "google")
+        await cl.Message(content="Google Calendar selected for calendar actions.").send()
+        return
+
+    if lower_text == "/usemicrosoft":
+        cl.user_session.set("calendar_provider", "microsoft")
+        if is_microsoft_connected(user_id):
+            content = "Microsoft Calendar selected for calendar actions."
+        else:
+            content = (
+                "Microsoft Calendar selected, but it is not connected yet.\n\n"
+                "Run `/microsoftcalendar` to connect your Outlook/Microsoft account."
+            )
+        await cl.Message(content=content).send()
+        return
+
+    if lower_text == "/calendar":
+        provider = cl.user_session.get("calendar_provider") or "google"
+        ms_status = "connected" if is_microsoft_connected(user_id) else "not connected"
+        await cl.Message(
+            content=(
+                f"Current calendar provider: **{provider}**\n\n"
+                f"Microsoft Calendar: {ms_status}\n"
+                "Use `/usegoogle`, `/usemicrosoft`, or `/microsoftcalendar`."
+            )
+        ).send()
+        return
+
+    if lower_text == "/microsoftcalendar":
+        try:
+            flow = start_microsoft_device_login(user_id)
+            cl.user_session.set("microsoft_device_flow", flow)
+            cl.user_session.set("awaiting_microsoft_login", True)
+            content = (
+                "Connect Microsoft Calendar:\n\n"
+                f"1. Open {flow.get('verification_uri')}\n"
+                f"2. Enter code `{flow.get('user_code')}`\n"
+                "3. Approve calendar access\n"
+                "4. Come back here and type **DONE**"
+            )
+        except Exception as e:
+            content = f"Could not start Microsoft login: {str(e)}"
+        await cl.Message(content=content).send()
+        return
+
+    if lower_text == "/switchmicrosoft":
+        was_connected = clear_microsoft_token(user_id)
+        cl.user_session.set("calendar_provider", "microsoft")
+        content = (
+            "Microsoft account disconnected. Run `/microsoftcalendar` to connect again."
+            if was_connected else
+            "No Microsoft account was connected. Run `/microsoftcalendar` to connect one."
+        )
+        await cl.Message(content=content).send()
+        return
+
     # ── COMMAND: /switchaccount ───────────────────────────────────
-    if message.content.strip().lower() == "/switchaccount":
+    if cl.user_session.get("awaiting_event_time"):
+        pending = cl.user_session.get("pending_event")
+        provider = pending.get("provider") or cl.user_session.get("calendar_provider") or "google"
+        pending["time"] = text
+        pending["provider"] = provider
+        cl.user_session.set("awaiting_event_time", False)
+        duration_minutes = resolve_duration(str(pending.get("duration", "1 hour")))
+        try:
+            result = provider_create_event(provider, user_id, pending, duration_minutes)
+        except Exception as e:
+            result = f"Couldn't create this {calendar_label(provider)} event: {str(e)}"
+        await cl.Message(content=result).send()
+        return
+
+    if lower_text == "/switchaccount":
         was_connected = clear_user_token(user_id)
         if was_connected:
             await cl.Message(
@@ -282,10 +495,9 @@ async def main(message: cl.Message):
             cl.user_session.set("awaiting_delete_confirm", False)
             pending = cl.user_session.get("pending_delete")
             try:
-                result = delete_calendar_event(
-                    user_id=user_id,
-                    title_keyword=pending["title"],
-                    date_input=pending["date"]
+                provider = pending.get("provider") or cl.user_session.get("calendar_provider") or "google"
+                result = provider_delete_event(
+                    provider, user_id, pending["title"], pending["date"]
                 )
                 await cl.Message(content=result).send()
             except Exception as e:
@@ -305,18 +517,11 @@ async def main(message: cl.Message):
             cl.user_session.set("awaiting_conflict_confirm", False)
             pending = cl.user_session.get("pending_event")
             try:
+                provider = pending.get("provider") or cl.user_session.get("calendar_provider") or "google"
                 duration_minutes = resolve_duration(
                     str(pending.get("duration", "1 hour"))
                 )
-                result = create_calendar_event(
-                    user_id=user_id,
-                    title=pending["title"],
-                    date_input=pending["date"],
-                    time_input=pending["time"],
-                    duration_minutes=duration_minutes,
-                    reminder_minutes=int(pending.get("reminder", 30)),
-                    recurrence=pending.get("recurrence")
-                )
+                result = provider_create_event(provider, user_id, pending, duration_minutes)
                 await cl.Message(content=result).send()
             except Exception as e:
                 await cl.Message(
@@ -454,12 +659,19 @@ async def main(message: cl.Message):
 
         # ── CALENDAR: CREATE EVENT ────────────────────────────────
         if action == "create_event":
+            provider = calendar_provider_from(
+                event_data,
+                message.content,
+                cl.user_session.get("calendar_provider"),
+            )
+            event_data["provider"] = provider
 
             if not event_data.get("time") or event_data.get("time").strip() == "":
                 cl.user_session.set("pending_event", event_data)
+                cl.user_session.set("awaiting_event_time", True)
                 reply = (
                     f"Got it! I have your event **{event_data['title']}** "
-                    f"on **{event_data['date']}**.\n\n"
+                    f"on **{event_data['date']}** in {calendar_label(provider)}.\n\n"
                     f"What time should I schedule it for?"
                 )
                 history.append({"role": "assistant", "content": reply})
@@ -472,16 +684,28 @@ async def main(message: cl.Message):
                 str(event_data.get("duration", "1 hour"))
             )
 
-            conflicts = check_conflicts(
-                user_id=user_id,
-                date_input=event_data["date"],
-                time_input=event_data["time"],
-                duration_minutes=duration_minutes
-            )
+            try:
+                conflicts = provider_check_conflicts(
+                    provider,
+                    user_id=user_id,
+                    date_input=event_data["date"],
+                    time_input=event_data["time"],
+                    duration_minutes=duration_minutes
+                )
+            except Exception as e:
+                reply = f"Couldn't check {calendar_label(provider)} conflicts: {str(e)}"
+                history.append({"role": "assistant", "content": reply})
+                cl.user_session.set("history", history)
+                save_history(user_id, history)
+                await cl.Message(content=reply).send()
+                return
 
             if conflicts:
                 conflict_list = "\n".join(
-                    [f"- {e.get('summary', 'Untitled')}" for e in conflicts]
+                    [
+                        f"- {e.get('summary') or e.get('subject') or 'Untitled'}"
+                        for e in conflicts
+                    ]
                 )
                 cl.user_session.set("pending_event", event_data)
                 cl.user_session.set("awaiting_conflict_confirm", True)
@@ -512,6 +736,7 @@ async def main(message: cl.Message):
             await cl.Message(
                 content=f"Got it! Creating this event:\n\n"
                         f"📌 **{event_data['title']}**\n"
+                        f"Calendar: {calendar_label(provider)}\n"
                         f"📅 Date: {event_data['date']}\n"
                         f"⏰ Time: {event_data['time']}\n"
                         f"⏱ Duration: {duration_text}\n"
@@ -521,29 +746,28 @@ async def main(message: cl.Message):
             ).send()
 
             try:
-                result = create_calendar_event(
-                    user_id=user_id,
-                    title=event_data["title"],
-                    date_input=event_data["date"],
-                    time_input=event_data["time"],
-                    duration_minutes=duration_minutes,
-                    reminder_minutes=int(event_data.get("reminder", 30)),
-                    recurrence=event_data.get("recurrence")
-                )
+                result = provider_create_event(provider, user_id, event_data, duration_minutes)
                 reply = result
             except Exception as e:
                 reply = (
-                    f"I understood the event but ran into an issue: {str(e)}\n\n"
-                    f"Make sure credentials.json is in your project folder."
+                    f"I understood the event but ran into an issue with "
+                    f"{calendar_label(provider)}: {str(e)}"
                 )
 
         # ── CALENDAR: DELETE EVENT ────────────────────────────────
         elif action == "delete_event":
+            provider = calendar_provider_from(
+                event_data,
+                message.content,
+                cl.user_session.get("calendar_provider"),
+            )
+            event_data["provider"] = provider
             cl.user_session.set("pending_delete", event_data)
             cl.user_session.set("awaiting_delete_confirm", True)
             reply = (
                 f"Are you sure you want to delete this event?\n\n"
                 f"📌 **{event_data['title']}**\n"
+                f"Calendar: {calendar_label(provider)}\n"
                 f"📅 Date: {event_data['date']}\n\n"
                 f"Type **YES** to confirm or **NO** to cancel."
             )
@@ -551,10 +775,12 @@ async def main(message: cl.Message):
         # ── CALENDAR: VIEW EVENTS ─────────────────────────────────
         elif action == "view_events":
             try:
-                result = get_events(
-                    user_id=user_id,
-                    date_input=event_data["date"]
+                provider = calendar_provider_from(
+                    event_data,
+                    message.content,
+                    cl.user_session.get("calendar_provider"),
                 )
+                result = provider_get_events(provider, user_id, event_data["date"])
                 reply = result
             except Exception as e:
                 reply = f"Couldn't fetch your calendar: {str(e)}"
@@ -592,10 +818,11 @@ async def main(message: cl.Message):
                 cl.user_session.set("last_followup_contact", contact)
 
                 # Generate the personalised message
-                msg = generate_followup_message(
+                msg, profile_complete, missing_fields = generate_followup_message(
                     contact=contact,
                     event_name=event_name or contact.get("event", ""),
-                    custom_note=custom_note
+                    custom_note=custom_note,
+                    user_id=user_id,
                 )
 
                 cl.user_session.set("pending_followup_message", msg)
