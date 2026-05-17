@@ -5,6 +5,7 @@ Full networking intelligence for Mynd:
 
   ✅ Contact storage with rich metadata
   ✅ Smart follow-up scoring (how hot is this lead?)
+  ✅ LLM-powered personalised message generation (Groq)
   ✅ Multi-platform message variants (WhatsApp / LinkedIn / Email)
   ✅ Event-level analytics (who did I meet at X?)
   ✅ Follow-up reminders (contacts not followed up after N days)
@@ -64,7 +65,7 @@ def load_user_profile(user_id: str) -> dict:
             profile = json.load(f)
             storage_tool.save_profile(user_id, profile)
             return profile
-    
+
     # Legacy global profile is imported only for the compatibility user.
     if user_id == DEFAULT_USER_ID and os.path.exists(PROFILE_FILE):
         with open(PROFILE_FILE) as f:
@@ -72,7 +73,7 @@ def load_user_profile(user_id: str) -> dict:
             # Migrate to per-user
             save_user_profile(user_id, global_profile)
             return global_profile
-    
+
     return EMPTY_PROFILE.copy()
 
 
@@ -137,10 +138,10 @@ def update_profile_field(key: str, value: str, user_id: str = None) -> dict:
 def format_profile_card(profile: dict) -> str:
     p = profile
     has_data = any([p.get('name'), p.get('email'), p.get('linkedin')])
-    
+
     if not has_data:
         return "❌ **Profile not set up yet!** Say `/profile` to add your details."
-    
+
     lines = [f"👤 **{p.get('name', '—')}**"]
     if p.get('email'):     lines.append(f"📧 {p['email']}")
     if p.get('phone'):     lines.append(f"📱 {p['phone']}")
@@ -150,7 +151,7 @@ def format_profile_card(profile: dict) -> str:
     if p.get('linkedin'):  lines.append(f"🔗 LinkedIn: {p['linkedin']}")
     if p.get('instagram'): lines.append(f"📸 Instagram: {p['instagram']}")
     if p.get('tagline'):   lines.append(f"💬 _{p['tagline']}_")
-    
+
     return "\n".join(lines)
 
 
@@ -347,40 +348,129 @@ def _compute_score(contact: dict) -> int:
 def get_priority_contacts(top_n: int = 5, user_id: str = DEFAULT_USER_ID) -> list:
     """Return top N contacts sorted by follow-up score descending."""
     contacts = load_contacts(user_id)
-    # Recompute scores fresh
     for c in contacts:
         c["score"] = _compute_score(c)
     return sorted(contacts, key=lambda x: x.get("score", 0), reverse=True)[:top_n]
 
 
-# ── Message generation ─────────────────────────────────────────────────────────
+# ── LLM helpers ────────────────────────────────────────────────────────────────
+
+def _get_groq_client():
+    """Get Groq client for LLM calls. Returns None if unavailable."""
+    try:
+        from groq import Groq
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return None
+        return Groq(api_key=api_key)
+    except ImportError:
+        return None
+
+
+def _generate_llm_message(contact, profile, event_name="", custom_note="",
+                          platform="whatsapp", tone="professional"):
+    """Use Groq LLM to generate a truly personalized follow-up message.
+    Returns None on failure so callers can fall back to templates."""
+    client = _get_groq_client()
+    if not client:
+        return None
+
+    first = (contact.get("name") or "there").split()[0]
+    event = event_name or contact.get("event", "a networking event")
+    notes = custom_note or contact.get("notes", "")
+
+    sender_lines = []
+    for k, label in [("name", "Name"), ("university", "Affiliation"),
+                     ("domains", "Domains"), ("org", "Organization"),
+                     ("tagline", "Tagline")]:
+        if profile.get(k):
+            sender_lines.append(f"{label}: {profile[k]}")
+
+    link_lines = []
+    if profile.get("linkedin"):
+        link_lines.append(f"LinkedIn: {profile['linkedin']}")
+    if profile.get("instagram"):
+        link_lines.append(f"Instagram: {profile['instagram']}")
+
+    recip_lines = [f"Name: {contact.get('name', 'Unknown')}"]
+    for k, label in [("role", "Role"), ("company", "Company")]:
+        if contact.get(k):
+            recip_lines.append(f"{label}: {contact[k]}")
+    recip_lines.append(f"Met at: {event}")
+    if notes:
+        recip_lines.append(f"Conversation notes: {notes}")
+
+    plat_hint = {
+        "whatsapp": "Casual, warm, under 120 words.",
+        "linkedin": "Professional, under 180 words. End with name.",
+        "email": "SUBJECT: line first, then body. Under 250 words.",
+    }
+    tone_hint = {
+        "casual": "Friendly and relaxed.",
+        "professional": "Polished but warm.",
+        "investor": "Value-focused.",
+        "sales": "Solution-oriented.",
+    }
+
+    prompt = (
+        "Write a networking follow-up message.\n\n"
+        "SENDER:\n" + "\n".join(sender_lines or ["No details."]) + "\n\n"
+        "SOCIAL LINKS (include at end):\n" + "\n".join(link_lines or ["None."]) + "\n\n"
+        "RECIPIENT:\n" + "\n".join(recip_lines) + "\n\n"
+        f"PLATFORM: {platform} — {plat_hint.get(platform, plat_hint['whatsapp'])}\n"
+        f"TONE: {tone} — {tone_hint.get(tone, tone_hint['professional'])}\n\n"
+        "RULES:\n"
+        f"- Reference SPECIFIC details from conversation notes\n"
+        f"- Address by first name ({first}) only\n"
+        "- Sound genuinely human, never templated\n"
+        "- Include social links at end as 'Let's stay connected:'\n"
+        "- Do NOT invent facts or use [brackets]\n"
+        "- End with a natural call-to-action"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=os.getenv("MYND_LLM_MODEL", "llama-3.3-70b-versatile"),
+            max_tokens=400,
+            temperature=0.7,
+            messages=[
+                {"role": "system", "content":
+                 "You write warm, personalized networking follow-up messages. "
+                 "Every message feels uniquely crafted. Never generic templates."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+# ── Message generation (LLM-first, template fallback) ─────────────────────────
 
 def generate_followup_message(
     contact: dict,
     event_name: str = "",
     custom_note: str = "",
     platform: str = "whatsapp",
-    user_id: str = None
+    user_id: str = None,
+    tone: str = "professional",
 ) -> tuple:
     """
     Generate a personalised follow-up message.
-    
+
+    Tries LLM generation first for dynamic, context-aware messages.
+    Falls back to templates if LLM is unavailable or fails.
+
     Returns: (message, profile_complete, missing_fields)
-    
-    platform: "whatsapp" | "linkedin" | "email"
-    WhatsApp  → casual, short, warm
-    LinkedIn  → professional, mention collaboration
-    Email     → formal subject + body
     """
-    
-    # Load USER'S actual profile (not hardcoded!)
+    # Load USER'S actual profile
     profile = load_user_profile(user_id) if user_id else load_profile()
-    
+
     # Check if profile is complete
     profile_complete = bool(profile.get("name")) and bool(
         profile.get("linkedin") or profile.get("instagram")
     )
-    
+
     missing_fields = []
     if not profile.get("name"):
         missing_fields.append("name")
@@ -388,8 +478,7 @@ def generate_followup_message(
         missing_fields.append("LinkedIn profile")
     if not profile.get("instagram"):
         missing_fields.append("Instagram profile")
-    
-    # If profile incomplete, return error message
+
     if not profile_complete:
         error_msg = (
             f"⚠️ **Can't generate follow-up message yet**\n\n"
@@ -398,8 +487,20 @@ def generate_followup_message(
             f"\n\nSay `/profile` to set up your details."
         )
         return (error_msg, False, missing_fields)
-    
-    # Extract contact info
+
+    # ── Try LLM-powered generation first ──────────────────────────────────────
+    llm_msg = _generate_llm_message(
+        contact=contact,
+        profile=profile,
+        event_name=event_name or contact.get("event", ""),
+        custom_note=custom_note,
+        platform=platform,
+        tone=tone,
+    )
+    if llm_msg:
+        return (llm_msg, True, [])
+
+    # ── Fallback to template generation ───────────────────────────────────────
     name      = contact.get("name", "there")
     first     = name.split()[0] if name else "there"
     event     = event_name or contact.get("event", "the event")
@@ -430,21 +531,19 @@ def generate_followup_message(
         profile_intro_parts.append(f"I work with startups in {profile['domains']}")
     if profile.get("org"):
         profile_intro_parts.append(f"and have exposure to {profile['org']}")
-    
+
     my_intro = " ".join(profile_intro_parts) if profile_intro_parts else "I'd love to connect and explore opportunities."
     my_value = profile.get("tagline", "I'm always keen to collaborate with ambitious founders!")
 
     # ── WhatsApp style ─────────────────────────────────────────────────────────
     if platform == "whatsapp":
         message = f"Hey {first},\n\n{opening}\n\n{my_intro}.\n\n{my_value}\n\n"
-        
         if profile.get("linkedin") or profile.get("instagram"):
             message += "Let's stay connected:\n"
             if profile.get("linkedin"):
                 message += f"🔗 LinkedIn: {profile['linkedin']}\n"
             if profile.get("instagram"):
                 message += f"📸 Instagram: {profile['instagram']}"
-        
         return (message, True, [])
 
     # ── LinkedIn style ─────────────────────────────────────────────────────────
@@ -478,12 +577,11 @@ def generate_followup_message(
             body += f"Email: {profile['email']}\n"
         if profile.get("linkedin"):
             body += f"LinkedIn: {profile['linkedin']}\n"
-        
         return (f"SUBJECT: {subject}\n\n{body}", True, [])
 
     # Fallback to the default WhatsApp style.
     return generate_followup_message(
-        contact, event_name, custom_note, "whatsapp", user_id
+        contact, event_name, custom_note, "whatsapp", user_id, tone
     )
 
 

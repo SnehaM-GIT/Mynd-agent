@@ -1,4 +1,5 @@
 import chainlit as cl  # creates the chat website UI
+import chainlit as cl  # creates the chat website UI
 from groq import Groq  # library to talk to Groq API and Llama model
 import os              # operating system — reads .env variables
 import datetime
@@ -940,9 +941,11 @@ async def main(message: cl.Message):
     reply = ""
 
     if not event_data:
+        # Truncate history to last 20 messages to prevent context overflow
+        recent_history = history[-20:] if len(history) > 20 else history
         full_messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
-        ] + history
+        ] + recent_history
 
         try:
             response = client.chat.completions.create(
@@ -1180,8 +1183,10 @@ async def main(message: cl.Message):
 
             if contact_id:
                 mark_message_sent(contact_id, platform="whatsapp/linkedin", user_id=user_id)
+                profile = load_user_profile(user_id)
+                user_name = profile.get("name", "").split()[0] if profile.get("name") else "there"
                 reply = (
-                    f"✅ Marked as sent! Great networking, Suriya 🤝\n\n"
+                    f"✅ Marked as sent! Great networking, {user_name} 🤝\n\n"
                     f"I've logged this follow-up in your contacts."
                 )
             else:

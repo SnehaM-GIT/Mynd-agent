@@ -8,6 +8,10 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# Configurable timezone — defaults to Asia/Kolkata (IST)
+CALENDAR_TIMEZONE = os.getenv("MYND_TIMEZONE", "Asia/Kolkata")
+CALENDAR_UTC_OFFSET = os.getenv("MYND_UTC_OFFSET", "+05:30")
+
 
 def get_token_path(user_id):
     """
@@ -271,8 +275,8 @@ def check_conflicts(user_id, date_input, time_input, duration_minutes=60):
     # Ask Google for any events overlapping this window
     events_result = service.events().list(
         calendarId="primary",
-        timeMin=start_datetime.isoformat() + "+05:30",
-        timeMax=end_datetime.isoformat() + "+05:30",
+        timeMin=start_datetime.isoformat() + CALENDAR_UTC_OFFSET,
+        timeMax=end_datetime.isoformat() + CALENDAR_UTC_OFFSET,
         singleEvents=True,
         orderBy="startTime"
     ).execute()
@@ -289,9 +293,9 @@ def get_events(user_id, date_input):
     service = get_calendar_service(user_id)
     date_str = resolve_date(date_input)
 
-    # Search full day from midnight to midnight in IST
-    time_min = f"{date_str}T00:00:00+05:30"
-    time_max = f"{date_str}T23:59:59+05:30"
+    # Search full day from midnight to midnight
+    time_min = f"{date_str}T00:00:00{CALENDAR_UTC_OFFSET}"
+    time_max = f"{date_str}T23:59:59{CALENDAR_UTC_OFFSET}"
 
     events_result = service.events().list(
         calendarId="primary",
@@ -352,11 +356,11 @@ def create_calendar_event(user_id, title, date_input, time_input,
         "summary": title,
         "start": {
             "dateTime": start_datetime,
-            "timeZone": "Asia/Kolkata",
+            "timeZone": CALENDAR_TIMEZONE,
         },
         "end": {
             "dateTime": end_datetime,
-            "timeZone": "Asia/Kolkata",
+            "timeZone": CALENDAR_TIMEZONE,
         },
         "reminders": {
             "useDefault": False,
@@ -426,6 +430,39 @@ def create_calendar_event(user_id, title, date_input, time_input,
     )
 
 
+def create_all_day_calendar_event(user_id, title, date_input, reminder_minutes=24 * 60):
+    """
+    Creates an all-day Google Calendar event.
+    Useful for birthdays, anniversaries, deadlines, holidays, and day blocks.
+    """
+    service = get_calendar_service(user_id)
+    date_str = resolve_date(date_input)
+    start_date = datetime.date.fromisoformat(date_str)
+    end_date = start_date + datetime.timedelta(days=1)
+
+    event = {
+        "summary": title,
+        "start": {"date": start_date.isoformat()},
+        "end": {"date": end_date.isoformat()},
+        "reminders": {
+            "useDefault": False,
+            "overrides": [
+                {"method": "popup", "minutes": reminder_minutes},
+                {"method": "email", "minutes": reminder_minutes},
+            ],
+        },
+    }
+
+    service.events().insert(calendarId="primary", body=event).execute()
+    readable_date = start_date.strftime("%A, %d %B %Y")
+    return (
+        "All-day Google Calendar event created successfully.\n\n"
+        f"{title}\n"
+        f"{readable_date}\n"
+        f"Reminder: {reminder_minutes // 60} hour(s) before"
+    )
+
+
 def delete_calendar_event(user_id, title_keyword, date_input):
     """
     Finds and deletes a calendar event by searching for a title keyword
@@ -438,9 +475,9 @@ def delete_calendar_event(user_id, title_keyword, date_input):
     # Resolve the date to standard format
     date_str = resolve_date(date_input)
 
-    # Search the full day from midnight to midnight in IST
-    time_min = f"{date_str}T00:00:00+05:30"
-    time_max = f"{date_str}T23:59:59+05:30"
+    # Search the full day from midnight to midnight
+    time_min = f"{date_str}T00:00:00{CALENDAR_UTC_OFFSET}"
+    time_max = f"{date_str}T23:59:59{CALENDAR_UTC_OFFSET}"
 
     # Fetch all events on that day from Google Calendar
     events_result = service.events().list(

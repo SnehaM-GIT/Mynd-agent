@@ -10,7 +10,11 @@
     <main class="app-shell">
       <section class="profile-panel">
         <div class="brand-row">
-          <div class="brand-mark">M</div>
+          <label class="brand-mark photo-picker">
+            <img id="profilePhoto" alt="" />
+            <span id="profileInitial">M</span>
+            <input id="profilePhotoInput" type="file" accept="image/*" />
+          </label>
           <div>
             <p class="eyebrow">Mynd</p>
             <h1>Entrepreneur Agent</h1>
@@ -87,7 +91,7 @@
             <h2>Tell Mynd what needs to get done.</h2>
             <p>
               Save contacts after events, draft follow-ups, prepare application answers,
-              and keep your business profile ready without repeating yourself.
+              schedule calendar tasks, and keep your business profile ready without repeating yourself.
             </p>
           </div>
         </section>
@@ -109,6 +113,10 @@
             <span>Contacts</span>
             <strong>Review saved leads</strong>
           </button>
+          <button class="task-card" data-prompt="Block 14 May 2026 as Sowmya's birthday on my Google Calendar">
+            <span>Calendar</span>
+            <strong>Add a date to Google Calendar</strong>
+          </button>
         </section>
 
         <section class="profile-preview">
@@ -117,6 +125,24 @@
             <h3 id="previewTitle">No profile saved yet</h3>
           </div>
           <dl id="profilePreview"></dl>
+        </section>
+
+        <section class="contact-tools">
+          <div>
+            <p class="eyebrow">Contacts</p>
+            <h3>Import, export, and review before saving</h3>
+          </div>
+          <div class="tool-row">
+            <label class="file-button">
+              Upload business card
+              <input id="businessCardInput" type="file" accept="image/*" />
+            </label>
+            <label class="file-button">
+              Import CSV
+              <input id="csvInput" type="file" accept=".csv,text/csv" />
+            </label>
+            <a class="secondary-link" href="/api/contacts/export">Export CSV</a>
+          </div>
         </section>
       </section>
 
@@ -134,6 +160,29 @@
           <button type="submit" class="send-button">Send</button>
         </form>
       </aside>
+
+      <div id="contactModal" class="modal hidden">
+        <form id="contactForm" class="modal-card">
+          <div class="modal-head">
+            <div>
+              <p class="eyebrow">Review contact</p>
+              <h3 id="contactModalTitle">Save contact</h3>
+            </div>
+            <button id="contactModalClose" class="icon-button" type="button">×</button>
+          </div>
+          <div class="modal-grid">
+            <label>Name<input name="name" /></label>
+            <label>Role<input name="role" /></label>
+            <label>Company<input name="company" /></label>
+            <label>Event<input name="event" /></label>
+            <label>Phone<input name="phone" /></label>
+            <label>Email<input name="email" /></label>
+            <label class="wide">LinkedIn<input name="linkedin" /></label>
+            <label class="wide">Notes<textarea name="notes" rows="3"></textarea></label>
+          </div>
+          <button class="primary-button" type="submit">Save contact</button>
+        </form>
+      </div>
     </main>
     <script src="/static/app.js"></script>
   </body>

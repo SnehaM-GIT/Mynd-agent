@@ -7,12 +7,21 @@ const profileMeta = document.querySelector("#profileMeta");
 const previewTitle = document.querySelector("#previewTitle");
 const profilePreview = document.querySelector("#profilePreview");
 const avatarButton = document.querySelector("#avatarButton");
+const profilePhoto = document.querySelector("#profilePhoto");
+const profileInitial = document.querySelector("#profileInitial");
+const profilePhotoInput = document.querySelector("#profilePhotoInput");
 const chatDrawer = document.querySelector("#chatDrawer");
 const chatToggle = document.querySelector("#chatToggle");
 const chatClose = document.querySelector("#chatClose");
 const messages = document.querySelector("#messages");
 const chatForm = document.querySelector("#chatForm");
 const chatInput = document.querySelector("#chatInput");
+const businessCardInput = document.querySelector("#businessCardInput");
+const csvInput = document.querySelector("#csvInput");
+const contactModal = document.querySelector("#contactModal");
+const contactForm = document.querySelector("#contactForm");
+const contactModalClose = document.querySelector("#contactModalClose");
+const contactModalTitle = document.querySelector("#contactModalTitle");
 
 const previewFields = [
   ["email", "Email"],
@@ -51,6 +60,13 @@ function renderProfile(profile) {
     ? "Ready for personalized tasks"
     : "Complete the form to personalize Mynd";
   avatarButton.textContent = initials(profile.name);
+  profileInitial.textContent = initials(profile.name);
+  if (profile.avatar_url) {
+    profilePhoto.src = profile.avatar_url;
+    profilePhoto.parentElement.classList.add("has-photo");
+  } else {
+    profilePhoto.parentElement.classList.remove("has-photo");
+  }
   previewTitle.textContent = profile.name || "No profile saved yet";
 
   profilePreview.innerHTML = "";
@@ -82,22 +98,64 @@ profileForm.addEventListener("submit", async (event) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (!response.ok) {
+    const error = await response.json();
+    addMessage("assistant", error.detail || "Please check the profile fields.");
+    return;
+  }
   const profile = await response.json();
   renderProfile(profile);
   addMessage("assistant", "Profile saved. You can now ask Mynd to draft follow-ups, save contacts, or prepare application answers.");
 });
 
+profilePhotoInput.addEventListener("change", async () => {
+  const file = profilePhotoInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch("/api/profile/photo", { method: "POST", body: form });
+  if (response.ok) {
+    const data = await response.json();
+    profilePhoto.src = data.avatar_url;
+    profilePhoto.parentElement.classList.add("has-photo");
+  }
+  profilePhotoInput.value = "";
+});
+
 function addMessage(role, text) {
   const bubble = document.createElement("div");
   bubble.className = `message ${role}`;
-  bubble.textContent = text;
+  bubble.innerHTML = linkify(text);
   messages.appendChild(bubble);
   messages.scrollTop = messages.scrollHeight;
+}
+
+function linkify(text) {
+  const escaped = String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+  return escaped
+    .replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>')
+    .replace(/(mailto:[^\s]+)/g, '<a href="$1">$1</a>');
 }
 
 async function sendChat(text) {
   const clean = text.trim();
   if (!clean) return;
+  if (/\b(i\s+)?met\s+/i.test(clean)) {
+    addMessage("user", clean);
+    chatInput.value = "";
+    const response = await fetch("/api/contacts/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: clean }),
+    });
+    const data = await response.json();
+    openContactModal(data.contact || {}, data.duplicate || null);
+    addMessage("assistant", data.duplicate ? "I found a possible duplicate. Review it before merging." : "I extracted the contact. Review it before saving.");
+    return;
+  }
   addMessage("user", clean);
   chatInput.value = "";
   const pending = document.createElement("div");
@@ -146,9 +204,56 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
   });
 });
 
+function openContactModal(contact = {}, duplicate = null) {
+  contactModal.classList.remove("hidden");
+  contactModalTitle.textContent = duplicate ? "Review duplicate before merge" : "Review before saving";
+  for (const element of contactForm.elements) {
+    if (!element.name) continue;
+    element.value = contact[element.name] || "";
+  }
+}
+
+contactModalClose.addEventListener("click", () => contactModal.classList.add("hidden"));
+
+contactForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = Object.fromEntries(new FormData(contactForm).entries());
+  const response = await fetch("/api/contacts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  contactModal.classList.add("hidden");
+  addMessage("assistant", `${data.message}\n\n${data.contact.name} is now in your contacts.`);
+});
+
+businessCardInput.addEventListener("change", async () => {
+  const file = businessCardInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  addMessage("user", `Uploaded business card: ${file.name}`);
+  const response = await fetch("/api/business-card", { method: "POST", body: form });
+  const data = await response.json();
+  openContactModal(data.contact || {}, data.duplicate || null);
+  businessCardInput.value = "";
+});
+
+csvInput.addEventListener("change", async () => {
+  const file = csvInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch("/api/contacts/import", { method: "POST", body: form });
+  const data = await response.json();
+  addMessage("assistant", `Imported ${data.imported || 0} contact(s) from CSV.`);
+  csvInput.value = "";
+});
+
 addMessage(
   "assistant",
-  "Welcome to Mynd. I can save networking contacts, draft follow-up messages, prepare application answers from your saved profile, and keep your business context ready. Tell me the task in plain English."
+  "Welcome to Mynd. I can save networking contacts, draft follow-up messages, prepare application answers from your saved profile, and schedule Google Calendar tasks. Tell me the task in plain English."
 );
 
 loadProfile();

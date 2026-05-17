@@ -20,6 +20,7 @@ from networking_tool import (
     get_priority_contacts,
     get_networking_stats,
     format_contact_card,
+    load_user_profile,
 )
 
 
@@ -35,7 +36,11 @@ def generate_daily_brief(calendar_events: list = None, user_id: str = "default")
     hour      = now.hour
     greeting  = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
 
-    lines = [f"# {greeting}, Suriya! 🚀", f"**{readable}**\n"]
+    # Use actual user name from profile instead of hardcoded name
+    profile = load_user_profile(user_id)
+    user_name = profile.get("name", "").split()[0] if profile.get("name") else "there"
+
+    lines = [f"# {greeting}, {user_name}! 🚀", f"**{readable}**\n"]
 
     # ── Calendar section ───────────────────────────────────────────
     lines.append("## 📅 Today's Schedule")

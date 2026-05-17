@@ -1,3 +1,5 @@
+import os
+import json
 import datetime
 import re
 from collections import defaultdict
@@ -112,10 +114,79 @@ def build_application_context(user_id: str) -> dict[str, str]:
     return context
 
 
-def draft_application(user_id: str, request_text: str) -> dict:
-    fields = _extract_requested_fields(request_text)
-    context = build_application_context(user_id)
+def _get_groq_client():
+    try:
+        from groq import Groq
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return None
+        return Groq(api_key=api_key)
+    except ImportError:
+        return None
 
+def _generate_llm_draft(request_text: str, context: dict[str, str]) -> dict:
+    client = _get_groq_client()
+    if not client:
+        return None
+
+    context_str = "\n".join([f"{k}: {v}" for k, v in context.items()])
+    
+    prompt = f"""You are an expert at helping entrepreneurs fill out applications, forms, and grants.
+I will give you a request describing the application and its fields, along with the user's stored context (profile and private vault info).
+Your job is to match the fields to the context and write the best possible answers.
+
+USER CONTEXT:
+{context_str}
+
+APPLICATION REQUEST:
+{request_text}
+
+Extract the requested fields from the application. 
+For each field, find the relevant information in the USER CONTEXT and draft a concise, professional answer. 
+If a field cannot be answered using the provided context, add it to the "missing" list.
+
+Respond ONLY with a JSON object in this exact format, no markdown formatting or extra text:
+{{
+  "answers": [
+    {{"field": "Name of field", "answer": "Drafted answer based on context", "source": "key from context used"}}
+  ],
+  "missing": [
+    "Field 1 that has no data",
+    "Field 2 that has no data"
+  ]
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("MYND_LLM_MODEL", "llama-3.3-70b-versatile"),
+            max_tokens=1024,
+            temperature=0.3,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content.strip())
+        return result
+    except Exception:
+        return None
+
+def draft_application(user_id: str, request_text: str) -> dict:
+    context = build_application_context(user_id)
+    
+    llm_draft = _generate_llm_draft(request_text, context)
+    if llm_draft:
+        title = _title_from_request(request_text)
+        draft = {
+            "title": title,
+            "request": request_text,
+            "answers": llm_draft.get("answers", []),
+            "missing": llm_draft.get("missing", []),
+            "created_for": "application",
+            "generated_at": datetime.datetime.now().isoformat(),
+        }
+        return storage_tool.save_application_draft(user_id, draft)
+
+    # Fallback to naive string matching
+    fields = _extract_requested_fields(request_text)
     answers = []
     missing = []
     for field in fields:
@@ -224,6 +295,9 @@ def _match_field(field: str, context: dict[str, str]) -> tuple[str | None, str |
         if any(alias in field_lower for alias in aliases) and key in context:
             return context[key], key
 
+    if normalized in FIELD_ALIASES:
+        return None, None
+
     field_tokens = set(re.findall(r"[a-z0-9]+", field_lower))
     best_key = None
     best_overlap = 0
@@ -240,7 +314,11 @@ def _match_field(field: str, context: dict[str, str]) -> tuple[str | None, str |
 
 
 def _title_from_request(text: str) -> str:
-    match = re.search(r"(?:for|to)\s+(.+?)(?:\s+fields?\b|\s+questions?\b|[.,\n]|$)", text, re.I)
+    match = re.search(
+        r"(?:for|to)\s+(.+?)(?:\s+(?:with\s+)?fields?\b|\s+questions?\b|[.,\n]|$)",
+        text,
+        re.I,
+    )
     if match:
         return match.group(1).strip()[:80]
     return "Application draft"
